@@ -11,10 +11,10 @@ uv add invoker-switch
 ## 快速开始
 
 ```python
-from invoker_switch import RpcBase
+from invoker_switch import InvokerBase
 
 
-class UserService(RpcBase):
+class UserService(InvokerBase):
     def get_name(self) -> str:
         return "Alice"
 
@@ -52,7 +52,7 @@ async def main():
 支持 同步→异步→同步→异步 交替调用，自动处理死锁防护。
 
 ```python
-class Service(RpcBase):
+class Service(InvokerBase):
     def entry(self) -> str:
         return self.async_step()  # 同步调用异步
 
@@ -72,13 +72,26 @@ result = svc.entry()  # → "async->done"
 
 ## API
 
-- `RpcBase` — RPC 基类，子类方法自动转发给 SyncInvoker
-- `RpcMeta` — 元类，拦截类创建并包装所有方法
+- `InvokerBase` — 基类，子类方法自动转发给 SyncInvoker
+- `InvokerMeta` — 元类，拦截类创建并包装所有方法
 - `SyncInvoker` — 核心执行器，自动判断执行策略
 - `EventLoopManager` — 事件循环管理器（外部注入/内置创建）
 - `MethodKind` — 方法类型枚举（SYNC/ASYNC/COROUTINE）
 - `CallFrame` — 调用栈帧
 - `run_callable()` — 轻量级异步执行工具
+
+## 项目结构
+
+```
+src/invoker_switch/
+├── __init__.py      # 公共 API 导出
+├── types.py         # MethodKind, CallFrame, _call_stack
+├── detection.py     # 字节码级 await 检测 (is_awaited)
+├── loop.py          # EventLoopManager 事件循环管理
+├── invoker.py       # SyncInvoker 核心执行器
+├── meta.py          # InvokerMeta 元类, InvokerBase 基类
+└── utils.py         # run_callable 轻量级工具
+```
 
 ## 开发
 

@@ -8,8 +8,8 @@ import pytest
 
 from invoker_switch import (
     CallFrame,
+    InvokerBase,
     MethodKind,
-    RpcBase,
     SyncInvoker,
 )
 
@@ -17,7 +17,7 @@ from invoker_switch import (
 # ─── 辅助类型与 Service ───
 
 
-class InvokerTestService(RpcBase):
+class InvokerTestService(InvokerBase):
     """用于测试 SyncInvoker 各种逻辑的服务"""
 
     def sync_identity(self, x: int) -> int:
@@ -76,8 +76,8 @@ class TestGetMethodKind:
         wrapper.__wrapped__ = original
         assert invoker._get_method_kind(wrapper) == MethodKind.ASYNC
 
-    def test_rpc_meta_wrapped_method(self):
-        """RpcMeta 包装后的方法，通过 __wrapped__ 应识别出原始类型"""
+    def test_invoker_meta_wrapped_method(self):
+        """InvokerMeta 包装后的方法，通过 __wrapped__ 应识别出原始类型"""
         # sync_identity 的 wrapper 本身是 sync，但 __wrapped__ 指向原始 sync
         assert InvokerTestService.sync_identity.__wrapped__ is not None
         invoker = SyncInvoker()
@@ -149,7 +149,7 @@ class TestContextVarIsolation:
 
         test_var: contextvars.ContextVar[str] = contextvars.ContextVar("test_var")
 
-        class ContextService(RpcBase):
+        class ContextService(InvokerBase):
             async def set_and_get(self, val: str) -> str:
                 test_var.set(val)
                 # 给其他 task 一个执行机会

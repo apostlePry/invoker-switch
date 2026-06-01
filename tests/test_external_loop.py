@@ -5,10 +5,10 @@ import threading
 
 import pytest
 
-from invoker_switch import EventLoopManager, RpcBase
+from invoker_switch import EventLoopManager, InvokerBase
 
 
-class ExternalLoopService(RpcBase):
+class ExternalLoopService(InvokerBase):
     """用于测试外部循环注入的服务"""
 
     def sync_work(self) -> str:

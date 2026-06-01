@@ -2,10 +2,10 @@
 
 import pytest
 
-from invoker_switch import RpcBase
+from invoker_switch import InvokerBase
 
 
-class ReentrantService(RpcBase):
+class ReentrantService(InvokerBase):
     """重入服务 — 同步→异步→同步 交替调用"""
 
     def entry(self) -> str:

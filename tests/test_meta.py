@@ -1,20 +1,20 @@
-"""RpcMeta 元类测试"""
+"""InvokerMeta 元类测试"""
 
 import asyncio
 from abc import abstractmethod
 
 import pytest
 
-from invoker_switch import RpcBase, RpcMeta, SyncInvoker
+from invoker_switch import InvokerBase, InvokerMeta, SyncInvoker, WRAPPER_FUNC_NAME
 
 
-class TestRpcMetaWrapping:
-    """测试 RpcMeta 的方法包装行为"""
+class TestInvokerMetaWrapping:
+    """测试 InvokerMeta 的方法包装行为"""
 
     def test_sync_method_is_wrapped(self):
         """同步方法应被包装，但通过 invoke 仍可正常调用"""
 
-        class Svc(RpcBase):
+        class Svc(InvokerBase):
             def hello(self):
                 return "hi"
 
@@ -24,7 +24,7 @@ class TestRpcMetaWrapping:
     def test_async_method_is_wrapped(self):
         """异步方法应被包装，但通过 invoke 仍可正常调用"""
 
-        class Svc(RpcBase):
+        class Svc(InvokerBase):
             async def hello(self):
                 return "hi"
 
@@ -34,7 +34,7 @@ class TestRpcMetaWrapping:
     def test_dunder_not_wrapped(self):
         """双下划线方法不应被包装"""
 
-        class Svc(RpcBase):
+        class Svc(InvokerBase):
             def __init__(self, name):
                 self.name = name
 
@@ -51,7 +51,7 @@ class TestRpcMetaWrapping:
     def test_class_attribute_not_wrapped(self):
         """类属性（非 callable）不应被包装"""
 
-        class Svc(RpcBase):
+        class Svc(InvokerBase):
             version = "1.0"
 
         assert Svc.version == "1.0"
@@ -59,7 +59,7 @@ class TestRpcMetaWrapping:
     def test_abstract_method_preserved(self):
         """抽象方法标记应被保留"""
 
-        class BaseSvc(RpcBase):
+        class BaseSvc(InvokerBase):
             @abstractmethod
             def must_implement(self):
                 ...
@@ -70,7 +70,7 @@ class TestRpcMetaWrapping:
     def test_wrapper_preserves_name(self):
         """wrapper 的 __name__ 和 __qualname__ 应与原始方法一致"""
 
-        class Svc(RpcBase):
+        class Svc(InvokerBase):
             def my_method(self):
                 return 42
 
@@ -79,7 +79,7 @@ class TestRpcMetaWrapping:
     def test_wrapper_preserves_wrapped(self):
         """wrapper 的 __wrapped__ 应指向原始方法"""
 
-        class Svc(RpcBase):
+        class Svc(InvokerBase):
             def my_method(self):
                 return 42
 
@@ -88,12 +88,12 @@ class TestRpcMetaWrapping:
         assert Svc.my_method.__wrapped__ is not None
 
 
-class TestRpcMetaCustomInvoker:
-    """测试 RpcMeta._get_invoker 和 _wrap_method 的可覆写性"""
+class TestInvokerMetaCustomInvoker:
+    """测试 InvokerMeta._get_invoker 和 _wrap_method 的可覆写性"""
 
     def test_get_invoker_returns_global(self):
         """默认 _get_invoker 返回全局 _invoker"""
-        invoker = RpcMeta._get_invoker()
+        invoker = InvokerMeta._get_invoker()
         assert isinstance(invoker, SyncInvoker)
 
     def test_wrap_method_creates_wrapper(self):
@@ -102,22 +102,23 @@ class TestRpcMetaCustomInvoker:
         def original(self, x):
             return x * 2
 
-        wrapper = RpcMeta._wrap_method("double", original)
+        wrapper = InvokerMeta._wrap_method("double", original)
         assert wrapper.__name__ == "double"
         assert wrapper.__wrapped__ is original
 
     def test_wrapper_func_name_constant(self):
         """_WRAPPER_FUNC_NAME 应为 'wrapper'"""
-        assert RpcMeta._WRAPPER_FUNC_NAME == "wrapper"
+        assert InvokerMeta._WRAPPER_FUNC_NAME == "wrapper"
+        assert WRAPPER_FUNC_NAME == "wrapper"
 
 
-class TestRpcMetaInheritance:
-    """测试 RpcMeta 的继承行为"""
+class TestInvokerMetaInheritance:
+    """测试 InvokerMeta 的继承行为"""
 
     def test_subclass_inherits_wrapping(self):
         """子类方法也应被自动包装"""
 
-        class Parent(RpcBase):
+        class Parent(InvokerBase):
             def parent_method(self):
                 return "parent"
 
@@ -132,7 +133,7 @@ class TestRpcMetaInheritance:
     def test_subclass_override(self):
         """子类覆写的方法也应被包装"""
 
-        class Parent(RpcBase):
+        class Parent(InvokerBase):
             def greet(self):
                 return "parent"
 

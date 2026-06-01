@@ -4,13 +4,13 @@ import asyncio
 
 import pytest
 
-from invoker_switch import MethodKind, RpcBase, SyncInvoker, run_callable
+from invoker_switch import InvokerBase, MethodKind, SyncInvoker, run_callable
 
 
 # ─── 测试用 Service ───
 
 
-class SimpleService(RpcBase):
+class SimpleService(InvokerBase):
     """简单服务，用于基础场景测试"""
 
     def sync_hello(self) -> str:
@@ -137,16 +137,16 @@ class TestRunCallable:
         assert result == 10
 
 
-# ─── RpcBase 基础测试 ───
+# ─── InvokerBase 基础测试 ───
 
 
-class TestRpcBase:
+class TestInvokerBase:
     def test_get_invoker(self):
         invoker = SimpleService.get_invoker()
         assert isinstance(invoker, SyncInvoker)
 
     def test_method_wrapped(self):
-        """确认 RpcMeta 已包装方法，__wrapped__ 指向原始方法"""
+        """确认 InvokerMeta 已包装方法，__wrapped__ 指向原始方法"""
         # sync_hello 应该被包装
         assert hasattr(SimpleService.sync_hello, "__wrapped__")
         # __wrapped__ 应该是原始函数
