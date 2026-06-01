@@ -1,8 +1,9 @@
 """事件循环管理器 — 双模式（外部注入 / 内置创建）"""
 
 import asyncio
-import concurrent.futures
 import threading
+
+from concurrent.futures import ThreadPoolExecutor
 
 from typing_extensions import Optional
 
@@ -18,12 +19,12 @@ class EventLoopManager:
 
     # 外部注入模式的状态
     _external_loop: Optional[asyncio.AbstractEventLoop] = None
-    _external_executor: Optional[concurrent.futures.ThreadPoolExecutor] = None
+    _external_executor: Optional[ThreadPoolExecutor] = None
 
     # 内置模式的状态
     _internal_loop: Optional[asyncio.AbstractEventLoop] = None
     _internal_thread: Optional[threading.Thread] = None
-    _internal_executor: Optional[concurrent.futures.ThreadPoolExecutor] = None
+    _internal_executor: Optional[ThreadPoolExecutor] = None
     _started: threading.Event = threading.Event()
     _lock: threading.Lock = threading.Lock()
 
@@ -31,7 +32,7 @@ class EventLoopManager:
     def set_event_loop(
         cls,
         loop: asyncio.AbstractEventLoop,
-        executor: Optional[concurrent.futures.ThreadPoolExecutor] = None,
+        executor: Optional[ThreadPoolExecutor] = None,
     ) -> None:
         """注入外部事件循环（如 FastAPI 的）"""
         cls._external_loop = loop
@@ -51,28 +52,32 @@ class EventLoopManager:
         return cls._ensure_internal_loop()
 
     @classmethod
-    def get_executor(cls) -> concurrent.futures.ThreadPoolExecutor:
+    def get_executor(cls) -> ThreadPoolExecutor:
         """获取线程池：优先外部，否则内置"""
         if cls._external_executor is not None:
             return cls._external_executor
         return cls._ensure_internal_executor()
 
     @classmethod
+    def _check_loop_closed(cls) -> bool:
+        """检查事件循环是否已关闭"""
+        assert cls._internal_loop is not None
+        if cls._internal_loop.is_closed():
+            cls._internal_loop = None
+            cls._internal_thread = None
+            return True
+        return False
+
+    @classmethod
     def _ensure_internal_loop(cls) -> asyncio.AbstractEventLoop:
         """双重检查锁定创建内置事件循环"""
         if cls._internal_loop is not None:
-            if cls._internal_loop.is_closed():
-                cls._internal_loop = None
-                cls._internal_thread = None
-            else:
+            if not cls._check_loop_closed():
                 return cls._internal_loop
 
         with cls._lock:
             if cls._internal_loop is not None:
-                if cls._internal_loop.is_closed():
-                    cls._internal_loop = None
-                    cls._internal_thread = None
-                else:
+                if not cls._check_loop_closed():
                     return cls._internal_loop
 
             # 尝试获取当前运行的事件循环
@@ -90,8 +95,10 @@ class EventLoopManager:
                     daemon=True,
                     name="invoker-bg-loop",
                 )
+                assert cls._internal_thread
                 cls._internal_thread.start()
                 cls._started.wait()  # 等待循环启动
+            assert cls._internal_loop is not None
             return cls._internal_loop
 
     @classmethod
@@ -104,19 +111,18 @@ class EventLoopManager:
         loop.run_forever()
 
     @classmethod
-    def _ensure_internal_executor(cls) -> concurrent.futures.ThreadPoolExecutor:
+    def _ensure_internal_executor(cls) -> ThreadPoolExecutor:
         """双重检查锁定创建内置线程池"""
         if cls._internal_executor is not None:
             return cls._internal_executor
 
         with cls._lock:
-            if cls._internal_executor is not None:
-                return cls._internal_executor
-
-            cls._internal_executor = concurrent.futures.ThreadPoolExecutor(
-                max_workers=10,
-                thread_name_prefix="invoker-worker",
-            )
+            if cls._internal_executor is None:
+                cls._internal_executor = ThreadPoolExecutor(
+                    max_workers=10,
+                    thread_name_prefix="invoker-worker",
+                )
+            assert cls._internal_executor
             return cls._internal_executor
 
     @classmethod
