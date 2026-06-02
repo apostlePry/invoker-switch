@@ -1,6 +1,5 @@
 """SyncInvoker — 统一同步/异步执行器"""
 
-from .detection import WRAPPER_FUNC_NAME
 from .invoker import SyncInvoker
 from .loop import EventLoopManager
 from .meta import InvokerBase, InvokerMeta, _invoker
@@ -21,7 +20,6 @@ __all__ = [
     "CallFrame",
     # 基础设施
     "EventLoopManager",
-    "WRAPPER_FUNC_NAME",
     # 工具
     "run_callable",
     # 兼容旧名称

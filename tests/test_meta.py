@@ -5,7 +5,7 @@ from abc import abstractmethod
 
 import pytest
 
-from invoker_switch import InvokerBase, InvokerMeta, SyncInvoker, WRAPPER_FUNC_NAME
+from invoker_switch import InvokerBase, InvokerMeta, SyncInvoker
 
 
 class TestInvokerMetaWrapping:
@@ -105,11 +105,6 @@ class TestInvokerMetaCustomInvoker:
         wrapper = InvokerMeta._wrap_method("double", original)
         assert wrapper.__name__ == "double"
         assert wrapper.__wrapped__ is original
-
-    def test_wrapper_func_name_constant(self):
-        """_WRAPPER_FUNC_NAME 应为 'wrapper'"""
-        assert InvokerMeta._WRAPPER_FUNC_NAME == "wrapper"
-        assert WRAPPER_FUNC_NAME == "wrapper"
 
 
 class TestInvokerMetaInheritance:

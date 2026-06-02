@@ -4,7 +4,6 @@ from abc import ABCMeta
 
 from typing_extensions import Any, Callable, Dict
 
-from .detection import WRAPPER_FUNC_NAME
 from .invoker import SyncInvoker
 
 # ─── 全局执行器实例 ───
@@ -20,10 +19,6 @@ class InvokerMeta(ABCMeta):
     2. 可覆写 —— InvokerMeta 子类可以定制包装策略
     3. invoker 来源可扩展 —— 通过 _get_invoker() 获取，而非硬编码全局变量
     """
-
-    # 供 detection.is_awaited() 检测用的 wrapper 函数名常量
-    # 与 detection.WRAPPER_FUNC_NAME 保持一致
-    _WRAPPER_FUNC_NAME: str = WRAPPER_FUNC_NAME
 
     @classmethod
     def _get_invoker(cls) -> SyncInvoker:
