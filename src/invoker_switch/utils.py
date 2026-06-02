@@ -1,53 +1,59 @@
-"""轻量级统一执行工具 — 同步/异步上下文均可使用"""
+"""轻量级统一执行工具 — 同步/异步双模式，由用户显式选择"""
 
 import asyncio
 
-from typing_extensions import Any, Callable, Union
+from typing_extensions import Any, Callable
 
+from .detection import is_awaited
 from .loop import EventLoopManager
 
 
-def _is_in_async_context() -> bool:
-    """检查当前是否在异步上下文中（有运行中的事件循环）"""
-    try:
-        asyncio.get_running_loop()
-    except RuntimeError:
-        return False
-    return True
+async def arun_callable(func: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
+    """异步模式执行同步/异步方法，始终返回协程
 
+    在异步上下文中使用，需要 await：
+        result = await arun_callable(sync_func)    → to_thread 卸载
+        result = await arun_callable(async_func)   → 直接 await
 
-def _run_sync_in_async(func: Callable[..., Any], args: tuple, kwargs: dict) -> Any:
-    """异步上下文中执行同步函数 — 通过 to_thread 卸载到线程池"""
-    return asyncio.to_thread(func, *args, **kwargs)
+    适用于：
+        - async def 函数内部
+        - asyncio.gather(*[arun_callable(f) for f in funcs])
+        - FastAPI 路由等异步场景
 
-
-def _run_async_in_sync(func: Callable[..., Any], args: tuple, kwargs: dict) -> Any:
-    """同步上下文中执行异步函数 — 提交到事件循环，阻塞等待结果"""
-    loop = EventLoopManager.get_event_loop()
-
-    async def _wrapper():
+    Args:
+        func: 要执行的函数，可以是同步或异步
+        *args: 位置参数
+        **kwargs: 关键字参数
+    """
+    if asyncio.iscoroutinefunction(func):
         return await func(*args, **kwargs)
-
-    future = asyncio.run_coroutine_threadsafe(_wrapper(), loop)
-    return future.result()
+    else:
+        return await asyncio.to_thread(func, *args, **kwargs)
 
 
 def run_callable(func: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
-    """统一执行同步/异步方法，自动适配当前上下文
+    """统一执行同步/异步方法，由用户通过 await 或 arun_callable 控制执行模式
 
-    同步上下文：
-        - 同步函数 → 线程池执行，阻塞等待结果
-        - 异步函数 → 提交到事件循环，阻塞等待结果
+    执行模式由调用方式决定：
 
-    异步上下文：
-        - 同步函数 → 通过 to_thread 卸载到线程池，返回协程
-        - 异步函数 → 直接 await，返回协程
+        无 await — 同步模式，直接返回结果：
+            result = run_callable(sync_func)     → 直接调用
+            result = run_callable(async_func)    → 提交到事件循环，阻塞等待
+
+        有 await — 异步模式，返回协程：
+            result = await run_callable(sync_func)   → to_thread 卸载
+            result = await run_callable(async_func)  → 直接 await
+
+    对于 gather 等需要显式协程的场景，使用 arun_callable：
+        await asyncio.gather(*[arun_callable(f) for f in funcs])
+
+    设计理念：
+        是否在异步环境中应由用户把控，而不是框架自动检测事件循环。
+        用户写 await 就是告诉框架"我在异步模式"，不写就是"我在同步模式"。
 
     与 SyncInvoker.invoke() 的区别：
-        - run_callable：轻量工具，不做 await 检测、不维护调用栈、不处理重入死锁
+        - run_callable：轻量函数式工具，不维护调用栈、不处理重入死锁
         - SyncInvoker：完整决策引擎，处理所有上下文组合和边界情况
-
-    适用于简单的函数式桥接场景，不需要声明 InvokerBase 子类。
 
     Args:
         func: 要执行的函数，可以是同步或异步
@@ -55,26 +61,27 @@ def run_callable(func: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
         **kwargs: 关键字参数
 
     Returns:
-        异步上下文中返回协程（需 await），同步上下文中直接返回结果
+        同步模式：直接返回结果
+        异步模式：返回协程（需 await）
     """
     is_async_func = asyncio.iscoroutinefunction(func)
-    in_async = _is_in_async_context()
+    awaited = is_awaited()
 
-    # ─── 同步上下文 ───
-    if not in_async:
+    # ─── 同步模式（无 await）→ 直接返回结果 ───
+    if not awaited:
         if is_async_func:
-            # 异步函数 → 提交到事件循环，阻塞等待
-            return _run_async_in_sync(func, args, kwargs)
-        else:
-            # 同步函数 → 线程池执行，阻塞等待
-            executor = EventLoopManager.get_executor()
-            future = executor.submit(func, *args, **kwargs)
+            # 异步函数 → 提交到事件循环，阻塞等待结果
+            loop = EventLoopManager.get_event_loop()
+            future = asyncio.run_coroutine_threadsafe(func(*args, **kwargs), loop)
             return future.result()
+        else:
+            # 同步函数 → 直接调用
+            return func(*args, **kwargs)
 
-    # ─── 异步上下文 ───
+    # ─── 异步模式（有 await）→ 返回协程 ───
     if is_async_func:
-        # 异步函数 → 直接 await
+        # 异步函数 → 直接返回协程
         return func(*args, **kwargs)
     else:
-        # 同步函数 → to_thread 卸载
-        return _run_sync_in_async(func, args, kwargs)
+        # 同步函数 → to_thread 卸载，返回协程
+        return asyncio.to_thread(func, *args, **kwargs)

@@ -14,7 +14,7 @@ import statistics
 
 import pytest
 
-from invoker_switch import InvokerBase, SyncInvoker, run_callable
+from invoker_switch import InvokerBase, SyncInvoker, arun_callable, run_callable
 
 
 # ─── 辅助工具 ───
@@ -220,25 +220,37 @@ class TestRunCallableOverhead:
         print(f"\n  [同步+异步] run_callable: {rc_stats['mean_us']:.1f} μs, SyncInvoker: {invoker_stats['mean_us']:.1f} μs")
 
     async def test_async_context_sync_func(self):
-        """异步上下文 + 同步函数：run_callable vs SyncInvoker"""
+        """异步上下文 + 同步函数：arun_callable vs SyncInvoker"""
         svc = PerfService()
 
-        invoker_stats = await _measure_async(lambda: svc.compute_sync(42), self.ITERATIONS)
-        rc_stats = await _measure_async(lambda: run_callable(lambda: 42 * 2), self.ITERATIONS)
+        async def _invoker_call():
+            await svc.compute_sync(42)
 
-        print(f"\n  [异步+同步] run_callable: {rc_stats['mean_us']:.1f} μs, SyncInvoker: {invoker_stats['mean_us']:.1f} μs")
+        async def _rc_call():
+            await arun_callable(lambda: 42 * 2)
+
+        invoker_stats = await _measure_async(_invoker_call, self.ITERATIONS)
+        rc_stats = await _measure_async(_rc_call, self.ITERATIONS)
+
+        print(f"\n  [异步+同步] arun_callable: {rc_stats['mean_us']:.1f} μs, SyncInvoker: {invoker_stats['mean_us']:.1f} μs")
 
     async def test_async_context_async_func(self):
-        """异步上下文 + 异步函数：run_callable vs SyncInvoker"""
+        """异步上下文 + 异步函数：arun_callable vs SyncInvoker"""
         svc = PerfService()
 
         async def _compute():
             return 42 * 2
 
-        invoker_stats = await _measure_async(lambda: svc.compute_async(42), self.ITERATIONS)
-        rc_stats = await _measure_async(lambda: run_callable(_compute), self.ITERATIONS)
+        async def _invoker_call():
+            await svc.compute_async(42)
 
-        print(f"\n  [异步+异步] run_callable: {rc_stats['mean_us']:.1f} μs, SyncInvoker: {invoker_stats['mean_us']:.1f} μs")
+        async def _rc_call():
+            await arun_callable(_compute)
+
+        invoker_stats = await _measure_async(_invoker_call, self.ITERATIONS)
+        rc_stats = await _measure_async(_rc_call, self.ITERATIONS)
+
+        print(f"\n  [异步+异步] arun_callable: {rc_stats['mean_us']:.1f} μs, SyncInvoker: {invoker_stats['mean_us']:.1f} μs")
 
 
 # ─── 4. 并发吞吐量 ───
@@ -266,7 +278,7 @@ class TestConcurrencyThroughput:
         assert throughput > 1000
 
     async def test_run_callable_concurrent(self):
-        """异步上下文中并发调用 run_callable 的吞吐量"""
+        """异步上下文中并发调用 arun_callable 的吞吐量"""
         concurrency = 100
         iterations = 10
 
@@ -275,12 +287,12 @@ class TestConcurrencyThroughput:
 
         start = time.perf_counter()
         for _ in range(iterations):
-            await asyncio.gather(*[run_callable(_noop) for _ in range(concurrency)])
+            await asyncio.gather(*[arun_callable(_noop) for _ in range(concurrency)])
         elapsed = time.perf_counter() - start
 
         total_calls = concurrency * iterations
         throughput = total_calls / elapsed
-        print(f"\n  [run_callable 吞吐量] {throughput:.0f} calls/sec ({total_calls} calls in {elapsed:.3f}s)")
+        print(f"\n  [arun_callable 吞吐量] {throughput:.0f} calls/sec ({total_calls} calls in {elapsed:.3f}s)")
 
         assert throughput > 1000
 

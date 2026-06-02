@@ -4,7 +4,7 @@ import asyncio
 
 import pytest
 
-from invoker_switch import InvokerBase, MethodKind, SyncInvoker, run_callable
+from invoker_switch import InvokerBase, MethodKind, SyncInvoker, arun_callable, run_callable
 
 
 # ─── 测试用 Service ───
@@ -149,37 +149,69 @@ class TestRunCallableSyncContext:
 
 
 class TestRunCallableAsyncContext:
-    """异步上下文中使用 run_callable"""
+    """异步上下文中使用 run_callable（通过 await 触发异步模式）"""
 
-    async def test_sync_func_in_async_context(self):
-        """异步上下文 + 同步函数 → to_thread，返回协程"""
+    async def test_sync_func_with_await(self):
+        """await run_callable(sync_func) → to_thread"""
         def sync_func():
             return "sync_result"
 
         result = await run_callable(sync_func)
         assert result == "sync_result"
 
-    async def test_async_func_in_async_context(self):
-        """异步上下文 + 异步函数 → 直接 await"""
+    async def test_async_func_with_await(self):
+        """await run_callable(async_func) → 直接 await"""
         async def async_func():
             return "async_result"
 
         result = await run_callable(async_func)
         assert result == "async_result"
 
-    async def test_sync_func_with_args_in_async_context(self):
+
+class TestArunCallable:
+    """arun_callable 显式异步模式测试"""
+
+    async def test_sync_func(self):
+        """arun_callable(sync_func) → to_thread"""
+        def sync_func():
+            return "sync_result"
+
+        result = await arun_callable(sync_func)
+        assert result == "sync_result"
+
+    async def test_async_func(self):
+        """arun_callable(async_func) → 直接 await"""
+        async def async_func():
+            return "async_result"
+
+        result = await arun_callable(async_func)
+        assert result == "async_result"
+
+    async def test_sync_func_with_args(self):
         def add(a, b):
             return a + b
 
-        result = await run_callable(add, 3, 7)
+        result = await arun_callable(add, 3, 7)
         assert result == 10
 
-    async def test_async_func_with_args_in_async_context(self):
+    async def test_async_func_with_args(self):
         async def multiply(a, b):
             return a * b
 
-        result = await run_callable(multiply, 4, 5)
+        result = await arun_callable(multiply, 4, 5)
         assert result == 20
+
+    async def test_gather(self):
+        """arun_callable 配合 asyncio.gather 使用"""
+        async def async_func(x):
+            return x * 2
+
+        results = await asyncio.gather(
+            arun_callable(async_func, 1),
+            arun_callable(async_func, 2),
+            arun_callable(async_func, 3),
+        )
+        assert results == [2, 4, 6]
 
 
 # ─── InvokerBase 基础测试 ───
