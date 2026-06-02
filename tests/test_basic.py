@@ -114,27 +114,72 @@ class TestAsyncContextSyncMethodNoAwait:
 # ─── run_callable 测试 ───
 
 
-class TestRunCallable:
-    async def test_run_callable_async(self):
+class TestRunCallableSyncContext:
+    """同步上下文中使用 run_callable"""
+
+    def test_sync_func_in_sync_context(self):
+        """同步上下文 + 同步函数 → 线程池执行，直接返回结果"""
+        def sync_func():
+            return "sync_result"
+
+        result = run_callable(sync_func)
+        assert result == "sync_result"
+
+    def test_async_func_in_sync_context(self):
+        """同步上下文 + 异步函数 → 提交到事件循环，阻塞等待结果"""
         async def async_func():
             return "async_result"
 
-        result = await run_callable(async_func)
+        result = run_callable(async_func)
         assert result == "async_result"
 
-    async def test_run_callable_sync(self):
+    def test_sync_func_with_args_in_sync_context(self):
+        def add(a, b):
+            return a + b
+
+        result = run_callable(add, 3, 7)
+        assert result == 10
+
+    def test_async_func_with_args_in_sync_context(self):
+        async def multiply(a, b):
+            return a * b
+
+        result = run_callable(multiply, 4, 5)
+        assert result == 20
+
+
+class TestRunCallableAsyncContext:
+    """异步上下文中使用 run_callable"""
+
+    async def test_sync_func_in_async_context(self):
+        """异步上下文 + 同步函数 → to_thread，返回协程"""
         def sync_func():
             return "sync_result"
 
         result = await run_callable(sync_func)
         assert result == "sync_result"
 
-    async def test_run_callable_with_args(self):
+    async def test_async_func_in_async_context(self):
+        """异步上下文 + 异步函数 → 直接 await"""
+        async def async_func():
+            return "async_result"
+
+        result = await run_callable(async_func)
+        assert result == "async_result"
+
+    async def test_sync_func_with_args_in_async_context(self):
         def add(a, b):
             return a + b
 
         result = await run_callable(add, 3, 7)
         assert result == 10
+
+    async def test_async_func_with_args_in_async_context(self):
+        async def multiply(a, b):
+            return a * b
+
+        result = await run_callable(multiply, 4, 5)
+        assert result == 20
 
 
 # ─── InvokerBase 基础测试 ───

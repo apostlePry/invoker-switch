@@ -1,6 +1,6 @@
 # invoker-switch
 
-**SyncInvoker — 统一同步/异步执行器**，透明桥接同步与异步调用，让用户完全不需要关心同步/异步边界。
+**统一同步/异步执行器**，透明桥接同步与异步调用，让用户完全不需要关心同步/异步边界。
 
 ## 安装
 
@@ -9,6 +9,8 @@ uv add invoker-switch
 ```
 
 ## 快速开始
+
+### 通过 InvokerBase 声明式使用
 
 ```python
 from invoker_switch import InvokerBase
@@ -32,6 +34,27 @@ avatar = svc.fetch_avatar()  # → "https://avatar.example.com/alice.png"
 async def main():
     name = svc.get_name()              # 直接得到结果
     avatar = await svc.fetch_avatar()  # 返回协程
+```
+
+### 通过 run_callable 函数式使用
+
+```python
+from invoker_switch import run_callable
+
+def sync_work():
+    return "sync_result"
+
+async def async_work():
+    return "async_result"
+
+# 同步上下文中调用 — 统一返回结果
+run_callable(sync_work)    # → "sync_result"
+run_callable(async_work)   # → "async_result"
+
+# 异步上下文中调用 — 统一返回结果
+async def main():
+    result = await run_callable(sync_work)   # → "sync_result"
+    result = await run_callable(async_work)  # → "async_result"
 ```
 
 ## 核心概念
@@ -70,15 +93,39 @@ svc = Service()
 result = svc.entry()  # → "async->done"
 ```
 
+### 两种使用方式对比
+
+| 特性 | `InvokerBase` 声明式 | `run_callable` 函数式 |
+|------|----------------------|----------------------|
+| 使用方式 | 继承基类，方法自动桥接 | 逐个函数调用 |
+| 同步/异步上下文 | 自动适配 | 自动适配 |
+| await 感知 | ✓ 字节码级检测 | ✗ 不做 await 检测 |
+| 调用栈追踪 | ✓ 完整 CallFrame 链 | ✗ 无调用栈 |
+| 重入死锁防护 | ✓ 完整防护 | ✗ 无防护 |
+| 适用场景 | 服务类、长期维护的代码 | 简单调用、一次性桥接 |
+
 ## API
 
-- `InvokerBase` — 基类，子类方法自动转发给 SyncInvoker
-- `InvokerMeta` — 元类，拦截类创建并包装所有方法
-- `SyncInvoker` — 核心执行器，自动判断执行策略
-- `EventLoopManager` — 事件循环管理器（外部注入/内置创建）
-- `MethodKind` — 方法类型枚举（SYNC/ASYNC/COROUTINE）
-- `CallFrame` — 调用栈帧
-- `run_callable()` — 轻量级异步执行工具
+### 核心
+
+- **`InvokerBase`** — 基类，子类方法自动转发给 SyncInvoker
+- **`InvokerMeta`** — 元类，拦截类创建并包装所有方法
+- **`SyncInvoker`** — 核心执行器，自动判断执行策略
+
+### 工具
+
+- **`run_callable(func, *args, **kwargs)`** — 轻量级统一执行工具，同步/异步上下文均可使用
+  - 同步上下文：调用同步函数直接执行，调用异步函数提交到事件循环阻塞等待
+  - 异步上下文：调用同步函数通过 `to_thread` 执行，调用异步函数直接 `await`
+
+### 基础设施
+
+- **`EventLoopManager`** — 事件循环管理器（外部注入 / 内置创建）
+
+### 类型
+
+- **`MethodKind`** — 方法类型枚举（`SYNC` / `ASYNC` / `COROUTINE`）
+- **`CallFrame`** — 调用栈帧
 
 ## 项目结构
 
@@ -90,7 +137,7 @@ src/invoker_switch/
 ├── loop.py          # EventLoopManager 事件循环管理
 ├── invoker.py       # SyncInvoker 核心执行器
 ├── meta.py          # InvokerMeta 元类, InvokerBase 基类
-└── utils.py         # run_callable 轻量级工具
+└── utils.py         # run_callable 统一执行工具
 ```
 
 ## 开发
