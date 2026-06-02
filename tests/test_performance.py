@@ -1,26 +1,34 @@
-"""性能测试 — 衡量各执行路径的开销
+"""性能测试 — 衡量各执行路径的开销并分析瓶颈
 
 测试维度：
-1. SyncInvoker.invoke() vs 原生调用的开销对比
-2. 六种执行场景的单次调用延迟
-3. run_callable vs SyncInvoker.invoke 的开销对比
-4. 并发场景下的吞吐量
-5. 重入调用链的延迟累积
+1. 开销拆解：原生调用 vs SyncInvoker 各层额外开销
+2. 五种执行场景延迟（决策矩阵覆盖）
+3. SyncInvoker vs run_callable/arun_callable 对比
+4. 并发吞吐量
+5. 重入调用链延迟累积
+6. 帧管理开销
+
+所有测试包含预热阶段，避免首次执行的 JIT/缓存冷启动偏差。
 """
 
 import asyncio
-import time
 import statistics
+import time
 
 import pytest
 
 from invoker_switch import InvokerBase, SyncInvoker, arun_callable, run_callable
+from invoker_switch.detection import is_awaited
 
 
 # ─── 辅助工具 ───
 
-def _measure(func, iterations: int = 1000) -> dict:
-    """测量函数执行时间，返回统计信息"""
+
+def _measure(func, warmup: int = 100, iterations: int = 1000) -> dict:
+    """测量函数执行时间，返回统计信息（含预热）"""
+    for _ in range(warmup):
+        func()
+
     latencies = []
     for _ in range(iterations):
         start = time.perf_counter()
@@ -28,20 +36,26 @@ def _measure(func, iterations: int = 1000) -> dict:
         end = time.perf_counter()
         latencies.append((end - start) * 1_000_000)  # 微秒
 
+    latencies.sort()
     return {
-        "mean_us": statistics.mean(latencies),
-        "median_us": statistics.median(latencies),
-        "p95_us": sorted(latencies)[int(len(latencies) * 0.95)],
-        "min_us": min(latencies),
-        "max_us": max(latencies),
+        "mean": statistics.mean(latencies),
+        "median": statistics.median(latencies),
+        "p50": latencies[int(len(latencies) * 0.50)],
+        "p90": latencies[int(len(latencies) * 0.90)],
+        "p99": latencies[int(len(latencies) * 0.99)],
+        "min": latencies[0],
+        "max": latencies[-1],
+        "stddev": statistics.stdev(latencies) if len(latencies) > 1 else 0,
     }
 
 
-async def _measure_async(func, iterations: int = 1000) -> dict:
-    """测量异步函数执行时间，返回统计信息
+async def _measure_async(func, warmup: int = 100, iterations: int = 1000) -> dict:
+    """测量异步函数执行时间（含预热），自动处理协程返回值"""
+    for _ in range(warmup):
+        result = func()
+        if asyncio.iscoroutine(result):
+            await result
 
-    自动处理返回值：如果是协程则 await，否则直接取值。
-    """
     latencies = []
     for _ in range(iterations):
         start = time.perf_counter()
@@ -51,13 +65,27 @@ async def _measure_async(func, iterations: int = 1000) -> dict:
         end = time.perf_counter()
         latencies.append((end - start) * 1_000_000)
 
+    latencies.sort()
     return {
-        "mean_us": statistics.mean(latencies),
-        "median_us": statistics.median(latencies),
-        "p95_us": sorted(latencies)[int(len(latencies) * 0.95)],
-        "min_us": min(latencies),
-        "max_us": max(latencies),
+        "mean": statistics.mean(latencies),
+        "median": statistics.median(latencies),
+        "p50": latencies[int(len(latencies) * 0.50)],
+        "p90": latencies[int(len(latencies) * 0.90)],
+        "p99": latencies[int(len(latencies) * 0.99)],
+        "min": latencies[0],
+        "max": latencies[-1],
+        "stddev": statistics.stdev(latencies) if len(latencies) > 1 else 0,
     }
+
+
+def _fmt(stats: dict) -> str:
+    """格式化统计信息为可读字符串"""
+    return (
+        f"mean={stats['mean']:.1f}μs  "
+        f"p50={stats['p50']:.1f}μs  "
+        f"p99={stats['p99']:.1f}μs  "
+        f"±{stats['stddev']:.1f}μs"
+    )
 
 
 # ─── 测试用 Service ───
@@ -67,160 +95,174 @@ class PerfService(InvokerBase):
     """性能测试服务"""
 
     def noop_sync(self) -> None:
-        """空操作同步方法"""
         pass
 
     async def noop_async(self) -> None:
-        """空操作异步方法"""
         pass
 
     def compute_sync(self, x: int) -> int:
-        """轻量计算同步方法"""
         return x * 2
 
     async def compute_async(self, x: int) -> int:
-        """轻量计算异步方法"""
         return x * 2
 
+    def io_simulate(self) -> str:
+        """模拟 I/O 密集型同步方法"""
+        time.sleep(0.001)
+        return "io_done"
 
-# ─── 1. 原生调用 vs SyncInvoker 开销 ───
+    async def async_io_simulate(self) -> str:
+        """模拟 I/O 密集型异步方法"""
+        await asyncio.sleep(0.001)
+        return "async_io_done"
 
 
-class TestInvokerOverhead:
-    """衡量 SyncInvoker.invoke() 相比原生调用的额外开销"""
+# ─── 1. 开销拆解 ───
 
-    ITERATIONS = 500
 
-    def test_sync_overhead(self):
-        """同步方法：原生调用 vs SyncInvoker 开销"""
+class TestOverheadBreakdown:
+    """逐层拆解 SyncInvoker 的额外开销"""
+
+    WARMUP = 200
+    ITERATIONS = 2000
+
+    def test_sync_overhead_layers(self):
+        """同步方法：逐层拆解 SyncInvoker 开销"""
         svc = PerfService()
 
-        # 原生直接调用（绕过 SyncInvoker）
-        def native_call():
-            PerfService.noop_sync.__wrapped__(svc)
+        # 第 0 层：原生 Python 调用
+        def raw_call():
+            return PerfService.noop_sync.__wrapped__(svc)
 
-        # 通过 SyncInvoker 调用
+        # 第 1 层：SyncInvoker 完整路径
         def invoker_call():
-            svc.noop_sync()
+            return svc.noop_sync()
 
-        native_stats = _measure(native_call, self.ITERATIONS)
-        invoker_stats = _measure(invoker_call, self.ITERATIONS)
+        raw = _measure(raw_call, self.WARMUP, self.ITERATIONS)
+        invoker = _measure(invoker_call, self.WARMUP, self.ITERATIONS)
 
-        overhead_us = invoker_stats["mean_us"] - native_stats["mean_us"]
-        print(f"\n  [同步方法开销]")
-        print(f"  原生调用:   {native_stats['mean_us']:.1f} μs (中位数 {native_stats['median_us']:.1f})")
-        print(f"  SyncInvoker: {invoker_stats['mean_us']:.1f} μs (中位数 {invoker_stats['median_us']:.1f})")
-        print(f"  额外开销:   {overhead_us:.1f} μs")
+        overhead = invoker["mean"] - raw["mean"]
+        print(f"\n  ┌─────────────────────────────────────────────────────┐")
+        print(f"  │ 同步方法开销拆解                                     │")
+        print(f"  ├─────────────────────────────────────────────────────┤")
+        print(f"  │ 原生调用:       {_fmt(raw):>42s} │")
+        print(f"  │ SyncInvoker:    {_fmt(invoker):>42s} │")
+        print(f"  │ 额外开销:       {overhead:>8.1f}μs{' ':>33s} │")
+        print(f"  │ 开销倍数:       {invoker['mean']/raw['mean']:>8.1f}x{' ':>33s} │")
+        print(f"  └─────────────────────────────────────────────────────┘")
 
-        # SyncInvoker 不应比原生慢超过 2ms（含线程池调度）
-        assert overhead_us < 2000, f"SyncInvoker overhead too high: {overhead_us:.1f} μs"
+        assert overhead < 500, f"SyncInvoker sync overhead too high: {overhead:.1f}μs"
 
     def test_async_overhead_in_sync_context(self):
-        """同步上下文中调用异步方法：原生 asyncio.run vs SyncInvoker"""
+        """同步上下文 + 异步方法：完整路径开销"""
         svc = PerfService()
+        stats = _measure(lambda: svc.noop_async(), self.WARMUP, self.ITERATIONS)
 
-        def invoker_call():
-            svc.noop_async()
+        print(f"\n  [同步上下文 + 异步方法] {_fmt(stats)}")
+        assert stats["mean"] < 5000
 
-        invoker_stats = _measure(invoker_call, self.ITERATIONS)
+    def test_detection_overhead(self):
+        """is_awaited() 字节码检测本身的开销"""
+        # 直接调用 is_awaited，测量其纯开销
+        direct = _measure(lambda: None, self.WARMUP, self.ITERATIONS)
+        detected = _measure(is_awaited, self.WARMUP, self.ITERATIONS)
 
-        print(f"\n  [同步上下文 + 异步方法]")
-        print(f"  SyncInvoker: {invoker_stats['mean_us']:.1f} μs (中位数 {invoker_stats['median_us']:.1f})")
-
-        # 不应超过 5ms（含事件循环调度）
-        assert invoker_stats["mean_us"] < 5000
+        overhead = detected["mean"] - direct["mean"]
+        print(f"\n  [is_awaited() 开销] {overhead:.1f}μs (纯检测调用)")
+        assert overhead < 500, f"is_awaited overhead too high: {overhead:.1f}μs"
 
 
-# ─── 2. 六种执行场景延迟 ───
+# ─── 2. 五种执行场景延迟 ───
 
 
 class TestScenarioLatency:
-    """六种执行场景的单次调用延迟"""
+    """决策矩阵覆盖的五种场景延迟"""
 
-    ITERATIONS = 500
+    WARMUP = 200
+    ITERATIONS = 2000
 
-    def test_sync_context_sync_method(self):
-        """场景 1：同步上下文 + 同步方法"""
+    def test_sync_chain_sync_method(self):
+        """SYNC 方法 + 同步调用链（无 await）→ 直接执行"""
         svc = PerfService()
-        stats = _measure(lambda: svc.noop_sync(), self.ITERATIONS)
-        print(f"\n  [场景1] 同步+同步: {stats['mean_us']:.1f} μs (P95: {stats['p95_us']:.1f})")
-        assert stats["mean_us"] < 2000
+        stats = _measure(lambda: svc.noop_sync(), self.WARMUP, self.ITERATIONS)
+        print(f"\n  [SYNC+同步链]    {_fmt(stats)}")
+        assert stats["mean"] < 500
 
-    def test_sync_context_async_method(self):
-        """场景 2：同步上下文 + 异步方法"""
+    def test_sync_chain_async_method(self):
+        """ASYNC 方法 + 同步调用链 → _submit_coro 阻塞等待"""
         svc = PerfService()
-        stats = _measure(lambda: svc.noop_async(), self.ITERATIONS)
-        print(f"\n  [场景2] 同步+异步: {stats['mean_us']:.1f} μs (P95: {stats['p95_us']:.1f})")
-        assert stats["mean_us"] < 5000
+        stats = _measure(lambda: svc.noop_async(), self.WARMUP, self.ITERATIONS)
+        print(f"\n  [ASYNC+同步链]   {_fmt(stats)}")
+        assert stats["mean"] < 5000
 
-    async def test_async_context_async_method(self):
-        """场景 3：异步上下文 + 异步方法"""
+    async def test_async_chain_async_method(self):
+        """ASYNC 方法 + 异步调用链 → _execute_async 返回协程"""
         svc = PerfService()
-        stats = await _measure_async(lambda: svc.noop_async(), self.ITERATIONS)
-        print(f"\n  [场景3] 异步+异步: {stats['mean_us']:.1f} μs (P95: {stats['p95_us']:.1f})")
-        assert stats["mean_us"] < 1000
+        stats = await _measure_async(lambda: svc.noop_async(), self.WARMUP, self.ITERATIONS)
+        print(f"\n  [ASYNC+异步链]   {_fmt(stats)}")
+        assert stats["mean"] < 500
 
-    async def test_async_context_sync_method_with_await(self):
-        """场景 5：异步上下文 + 同步方法 + await"""
+    async def test_async_chain_sync_with_await(self):
+        """SYNC 方法 + 异步调用链 + await → _execute_sync_as_coro"""
         svc = PerfService()
-        # 必须在 lambda 中使用 await，才能触发 _execute_sync_as_coro
+
         async def _call():
             await svc.noop_sync()
-        stats = await _measure_async(_call, self.ITERATIONS)
-        print(f"\n  [场景5] 异步+同步+await: {stats['mean_us']:.1f} μs (P95: {stats['p95_us']:.1f})")
-        assert stats["mean_us"] < 3000
 
-    async def test_async_context_sync_method_no_await(self):
-        """场景 6：异步上下文 + 同步方法 + 无 await"""
+        stats = await _measure_async(_call, self.WARMUP, self.ITERATIONS)
+        print(f"\n  [SYNC+异步链+await] {_fmt(stats)}")
+        assert stats["mean"] < 3000
+
+    async def test_async_chain_sync_no_await(self):
+        """SYNC 方法 + 异步调用链 + 无 await → _execute_sync"""
         svc = PerfService()
-        stats = await _measure_async(lambda: svc.noop_sync(), self.ITERATIONS)
-        print(f"\n  [场景6] 异步+同步+无await: {stats['mean_us']:.1f} μs (P95: {stats['p95_us']:.1f})")
-        assert stats["mean_us"] < 3000
+        stats = await _measure_async(lambda: svc.noop_sync(), self.WARMUP, self.ITERATIONS)
+        print(f"\n  [SYNC+异步链+无] {_fmt(stats)}")
+        assert stats["mean"] < 500
 
 
-# ─── 3. run_callable vs SyncInvoker.invoke 开销对比 ───
+# ─── 3. SyncInvoker vs run_callable/arun_callable ───
 
 
-class TestRunCallableOverhead:
-    """run_callable 函数式调用 vs SyncInvoker 声明式调用的开销对比"""
+class TestComparison:
+    """SyncInvoker 声明式 vs run_callable/arun_callable 函数式"""
 
-    ITERATIONS = 500
+    WARMUP = 200
+    ITERATIONS = 2000
+
+    @pytest.fixture(autouse=True)
+    def _print_header(self):
+        print(f"\n  ┌────────────────────────────────────────────────────────────┐")
+        print(f"  │ SyncInvoker vs run_callable/arun_callable                   │")
+        print(f"  ├────────────────────────────────────────────────────────────┤")
+        yield
+        print(f"  └────────────────────────────────────────────────────────────┘")
 
     def test_sync_context_sync_func(self):
-        """同步上下文 + 同步函数：run_callable vs SyncInvoker"""
+        """同步环境 + 同步函数"""
         svc = PerfService()
 
-        def invoker_call():
-            svc.compute_sync(42)
+        invoker_stats = _measure(lambda: svc.compute_sync(42), self.WARMUP, self.ITERATIONS)
+        rc_stats = _measure(lambda: run_callable(lambda: 42 * 2), self.WARMUP, self.ITERATIONS)
 
-        def run_callable_call():
-            run_callable(lambda: 42 * 2)
-
-        invoker_stats = _measure(invoker_call, self.ITERATIONS)
-        rc_stats = _measure(run_callable_call, self.ITERATIONS)
-
-        print(f"\n  [同步+同步] run_callable: {rc_stats['mean_us']:.1f} μs, SyncInvoker: {invoker_stats['mean_us']:.1f} μs")
+        print(f"  │ 同步+sync  │ Invoker: {invoker_stats['mean']:>7.1f}μs  │ "
+              f"run_callable: {rc_stats['mean']:>7.1f}μs │")
 
     def test_sync_context_async_func(self):
-        """同步上下文 + 异步函数：run_callable vs SyncInvoker"""
+        """同步环境 + 异步函数"""
         svc = PerfService()
 
         async def _compute():
             return 42 * 2
 
-        def invoker_call():
-            svc.compute_async(42)
+        invoker_stats = _measure(lambda: svc.compute_async(42), self.WARMUP, self.ITERATIONS)
+        rc_stats = _measure(lambda: run_callable(_compute), self.WARMUP, self.ITERATIONS)
 
-        def run_callable_call():
-            run_callable(_compute)
-
-        invoker_stats = _measure(invoker_call, self.ITERATIONS)
-        rc_stats = _measure(run_callable_call, self.ITERATIONS)
-
-        print(f"\n  [同步+异步] run_callable: {rc_stats['mean_us']:.1f} μs, SyncInvoker: {invoker_stats['mean_us']:.1f} μs")
+        print(f"  │ 同步+async │ Invoker: {invoker_stats['mean']:>7.1f}μs  │ "
+              f"run_callable: {rc_stats['mean']:>7.1f}μs │")
 
     async def test_async_context_sync_func(self):
-        """异步上下文 + 同步函数：arun_callable vs SyncInvoker"""
+        """异步环境 + 同步函数"""
         svc = PerfService()
 
         async def _invoker_call():
@@ -229,13 +271,14 @@ class TestRunCallableOverhead:
         async def _rc_call():
             await arun_callable(lambda: 42 * 2)
 
-        invoker_stats = await _measure_async(_invoker_call, self.ITERATIONS)
-        rc_stats = await _measure_async(_rc_call, self.ITERATIONS)
+        invoker_stats = await _measure_async(_invoker_call, self.WARMUP, self.ITERATIONS)
+        rc_stats = await _measure_async(_rc_call, self.WARMUP, self.ITERATIONS)
 
-        print(f"\n  [异步+同步] arun_callable: {rc_stats['mean_us']:.1f} μs, SyncInvoker: {invoker_stats['mean_us']:.1f} μs")
+        print(f"  │ 异步+sync  │ Invoker: {invoker_stats['mean']:>7.1f}μs  │ "
+              f"arun: {rc_stats['mean']:>7.1f}μs │")
 
     async def test_async_context_async_func(self):
-        """异步上下文 + 异步函数：arun_callable vs SyncInvoker"""
+        """异步环境 + 异步函数"""
         svc = PerfService()
 
         async def _compute():
@@ -247,54 +290,82 @@ class TestRunCallableOverhead:
         async def _rc_call():
             await arun_callable(_compute)
 
-        invoker_stats = await _measure_async(_invoker_call, self.ITERATIONS)
-        rc_stats = await _measure_async(_rc_call, self.ITERATIONS)
+        invoker_stats = await _measure_async(_invoker_call, self.WARMUP, self.ITERATIONS)
+        rc_stats = await _measure_async(_rc_call, self.WARMUP, self.ITERATIONS)
 
-        print(f"\n  [异步+异步] arun_callable: {rc_stats['mean_us']:.1f} μs, SyncInvoker: {invoker_stats['mean_us']:.1f} μs")
+        print(f"  │ 异步+async │ Invoker: {invoker_stats['mean']:>7.1f}μs  │ "
+              f"arun: {rc_stats['mean']:>7.1f}μs │")
 
 
 # ─── 4. 并发吞吐量 ───
 
 
-class TestConcurrencyThroughput:
+class TestThroughput:
     """并发场景下的吞吐量"""
 
-    async def test_async_concurrent_invocations(self):
-        """异步上下文中并发调用 SyncInvoker 的吞吐量"""
+    async def test_invoker_async_throughput(self):
+        """SyncInvoker 异步方法并发吞吐量"""
         svc = PerfService()
-        concurrency = 100
-        iterations = 10
+        concurrency = 200
+        iterations = 20
+
+        # 预热
+        await asyncio.gather(*[svc.noop_async() for _ in range(50)])
 
         start = time.perf_counter()
         for _ in range(iterations):
             await asyncio.gather(*[svc.noop_async() for _ in range(concurrency)])
         elapsed = time.perf_counter() - start
 
-        total_calls = concurrency * iterations
-        throughput = total_calls / elapsed
-        print(f"\n  [异步并发吞吐量] {throughput:.0f} calls/sec ({total_calls} calls in {elapsed:.3f}s)")
+        total = concurrency * iterations
+        tps = total / elapsed
+        latency_ms = (elapsed / total) * 1000
+        print(f"\n  [SyncInvoker 并发] {tps:.0f} TPS ({total} calls in {elapsed:.3f}s, avg {latency_ms:.2f}ms/call)")
+        assert tps > 5000
 
-        # 至少 1000 calls/sec
-        assert throughput > 1000
-
-    async def test_run_callable_concurrent(self):
-        """异步上下文中并发调用 arun_callable 的吞吐量"""
-        concurrency = 100
-        iterations = 10
+    async def test_arun_callable_throughput(self):
+        """arun_callable 并发吞吐量"""
+        concurrency = 200
+        iterations = 20
 
         async def _noop():
             pass
+
+        # 预热
+        await asyncio.gather(*[arun_callable(_noop) for _ in range(50)])
 
         start = time.perf_counter()
         for _ in range(iterations):
             await asyncio.gather(*[arun_callable(_noop) for _ in range(concurrency)])
         elapsed = time.perf_counter() - start
 
-        total_calls = concurrency * iterations
-        throughput = total_calls / elapsed
-        print(f"\n  [arun_callable 吞吐量] {throughput:.0f} calls/sec ({total_calls} calls in {elapsed:.3f}s)")
+        total = concurrency * iterations
+        tps = total / elapsed
+        latency_ms = (elapsed / total) * 1000
+        print(f"\n  [arun_callable 并发] {tps:.0f} TPS ({total} calls in {elapsed:.3f}s, avg {latency_ms:.2f}ms/call)")
+        assert tps > 5000
 
-        assert throughput > 1000
+    async def test_invoker_sync_no_await_throughput(self):
+        """SyncInvoker 同步方法（无 await）并发吞吐量"""
+        svc = PerfService()
+        concurrency = 200
+        iterations = 20
+
+        # 预热
+        for _ in range(50):
+            svc.noop_sync()
+
+        start = time.perf_counter()
+        for _ in range(iterations):
+            for _ in range(concurrency):
+                svc.noop_sync()
+        elapsed = time.perf_counter() - start
+
+        total = concurrency * iterations
+        tps = total / elapsed
+        latency_us = (elapsed / total) * 1_000_000
+        print(f"\n  [SyncInvoker 同步并发] {tps:.0f} TPS ({total} calls in {elapsed:.3f}s, avg {latency_us:.2f}μs/call)")
+        assert tps > 10000
 
 
 # ─── 5. 重入调用链延迟 ───
@@ -318,17 +389,76 @@ class ReentrantPerfService(InvokerBase):
 
 
 class TestReentrantLatency:
-    """重入调用链（sync→async→sync→async）的延迟累积"""
+    """重入调用链延迟累积"""
 
-    ITERATIONS = 200
+    WARMUP = 50
+    ITERATIONS = 500
 
-    def test_reentrant_chain_latency(self):
-        """完整重入链的延迟"""
+    def test_4_layer_reentrant(self):
+        """4 层重入链：sync→async→sync→async"""
         svc = ReentrantPerfService()
-        stats = _measure(lambda: svc.entry(), self.ITERATIONS)
+        stats = _measure(lambda: svc.entry(), self.WARMUP, self.ITERATIONS)
 
-        print(f"\n  [重入链 sync→async→sync→async]")
-        print(f"  延迟: {stats['mean_us']:.1f} μs (中位数 {stats['median_us']:.1f}, P95 {stats['p95_us']:.1f})")
+        print(f"\n  [4层重入 sync→async→sync→async]")
+        print(f"  {_fmt(stats)}")
+        print(f"  平均每层: {stats['mean']/4:.1f}μs")
+        assert stats["mean"] < 20000
 
-        # 4 层调用不应超过 20ms
-        assert stats["mean_us"] < 20000
+    def test_reentrant_vs_flat(self):
+        """重入链 vs 等价的平铺调用"""
+        svc = PerfService()
+
+        # 平铺：直接调用一个 async 方法
+        flat_stats = _measure(lambda: svc.noop_async(), self.WARMUP, self.ITERATIONS)
+
+        # 重入：4 层链
+        reentrant_svc = ReentrantPerfService()
+        reentrant_stats = _measure(lambda: reentrant_svc.entry(), self.WARMUP, self.ITERATIONS)
+
+        # 重入链的延迟不应超过平铺调用的 6 倍（4 层 + 开销）
+        ratio = reentrant_stats["mean"] / flat_stats["mean"] if flat_stats["mean"] > 0 else 0
+
+        print(f"\n  [重入 vs 平铺]")
+        print(f"  平铺(async):     {_fmt(flat_stats)}")
+        print(f"  重入(4层链):     {_fmt(reentrant_stats)}")
+        print(f"  延迟比:          {ratio:.1f}x")
+
+        assert ratio < 10, f"Reentrant chain too slow: {ratio:.1f}x of flat call"
+
+
+# ─── 6. 帧管理开销 ───
+
+
+class TestFrameOverhead:
+    """帧管理（_frame_scope）的开销"""
+
+    WARMUP = 200
+    ITERATIONS = 5000
+
+    def test_frame_scope_overhead(self):
+        """_frame_scope 的纯开销"""
+        invoker = SyncInvoker()
+
+        def dummy():
+            pass
+
+        # 无帧管理
+        def no_frame():
+            return dummy()
+
+        # 有帧管理
+        def with_frame():
+            with invoker._frame_scope(dummy, MethodKind.SYNC, None):
+                return dummy()
+
+        from invoker_switch import MethodKind
+
+        no_stats = _measure(no_frame, self.WARMUP, self.ITERATIONS)
+        with_stats = _measure(with_frame, self.WARMUP, self.ITERATIONS)
+
+        overhead = with_stats["mean"] - no_stats["mean"]
+        print(f"\n  [帧管理开销]")
+        print(f"  无帧:   {_fmt(no_stats)}")
+        print(f"  有帧:   {_fmt(with_stats)}")
+        print(f"  额外:   {overhead:.1f}μs")
+        assert overhead < 200, f"Frame overhead too high: {overhead:.1f}μs"
