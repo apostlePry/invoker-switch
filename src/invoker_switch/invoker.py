@@ -23,6 +23,7 @@ class SyncInvoker:
         ASYNC 方法 + 同步调用链 → _submit_coro()            阻塞等待
         SYNC 方法 + await       → _execute_sync_as_coro()   to_thread，返回协程
         SYNC 方法 + 无 await    → _execute_sync()           直接执行
+        COROUTINE 类型          → 等同 ASYNC 处理
     """
 
     # ─── 属性 ───
@@ -97,6 +98,21 @@ class SyncInvoker:
         finally:
             _call_stack.reset(token)
 
+    # ─── 协程执行辅助 ───
+
+    async def _invoke_coro(self, func: Callable[..., Any], args: tuple, kwargs: dict) -> Any:
+        """执行协程对象，兼容 ASYNC 函数和 COROUTINE 对象
+
+        ASYNC 函数：await func(*args, **kwargs) — 调用函数获得协程，再 await
+        COROUTINE 对象：await func — 已经是协程，直接 await（忽略 args/kwargs）
+        """
+        if inspect.iscoroutine(func):
+            # 协程对象已经是"待执行的异步结果"，直接 await
+            # 不能再传 args/kwargs——对协程对象调用 func(*args) 会创建新协程
+            return await func
+        else:
+            return await func(*args, **kwargs)
+
     # ─── 直接执行（异步调用链中） ───
 
     def _execute_sync(
@@ -124,8 +140,12 @@ class SyncInvoker:
 
         适用场景：异步调用链 + 同步方法 + 有 await
 
-        注意：asyncio.to_thread 内部会自动 copy_context 并在新线程中恢复，
-        不需要外部再 copy_context + ctx.run()，否则双重复制。
+        调用链传播：
+        asyncio.to_thread 在新线程中执行 func，ContextVar 会自动复制，
+        但 _call_stack 的帧信息不会带到新线程中。如果 func 内部再调用
+        其他 InvokerBase 方法，current_frame 会看到 None（新线程空栈），
+        导致调用链看起来"从入口重新开始"。这在大多数场景下不会出问题——
+        新线程中自然会开启一条新的调用链。
         """
         with self._frame_scope(func, MethodKind.SYNC, caller):
             return await asyncio.to_thread(func, *args, **kwargs)
@@ -137,12 +157,12 @@ class SyncInvoker:
         kwargs: Dict[str, Any],
         caller: Optional[CallFrame],
     ) -> Any:
-        """await 执行异步方法
+        """await 执行异步方法或协程对象
 
-        适用场景：异步调用链 + 异步方法
+        适用场景：异步调用链 + 异步方法 / 协程对象
         """
         with self._frame_scope(func, MethodKind.ASYNC, caller):
-            return await func(*args, **kwargs)
+            return await self._invoke_coro(func, args, kwargs)
 
     # ─── 阻塞等待（同步调用链中） ───
 
@@ -160,27 +180,32 @@ class SyncInvoker:
         前提：当前线程不是事件循环线程。
         如果在事件循环线程中调用此方法，future.result() 会阻塞事件循环导致死锁。
         这种场景在架构上不可能正确——在事件循环线程中不能用同步方式等待异步结果。
+
+        ContextVar 传播：
+        run_coroutine_threadsafe 会在提交时的上下文中创建 Task，
+        协程内部能正确读取当前线程的 ContextVar。如果协程修改了 ContextVar，
+        修改在协程所在的事件循环线程中可见，但不会自动传播回调用线程。
+        对于大多数场景（只读 ContextVar）这是足够的。
         """
         loop = EventLoopManager.get_event_loop()
 
-        # 安全检查：不能在事件循环线程中阻塞等待
+        # 安全检查：当前线程是否是事件循环线程
         try:
             running_loop = asyncio.get_running_loop()
+            in_loop_thread = running_loop is loop
+        except RuntimeError:
+            in_loop_thread = False
+
+        if in_loop_thread:
             raise RuntimeError(
                 f"Cannot block on async method '{func.__qualname__}' "
                 f"inside the event loop thread. "
                 f"Use 'await {func.__qualname__}()' instead."
             )
-        except RuntimeError as e:
-            # 如果是我们自己抛出的 RuntimeError，重新抛出
-            if "Cannot block on async method" in str(e):
-                raise
-            # get_running_loop() 抛出的 RuntimeError → 不在事件循环线程中，安全
-            pass
 
         async def _wrapper():
             with self._frame_scope(func, MethodKind.ASYNC, caller):
-                return await func(*args, **kwargs)
+                return await self._invoke_coro(func, args, kwargs)
 
         future = asyncio.run_coroutine_threadsafe(_wrapper(), loop)
         return future.result()
