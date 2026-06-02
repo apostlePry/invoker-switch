@@ -92,8 +92,8 @@ class TestGetMethodKind:
 
 
 class TestCallStack:
-    def test_push_pop_frame(self):
-        """压入和弹出栈帧应正确维护调用栈"""
+    def test_frame_scope_basic(self):
+        """_frame_scope 应正确维护调用栈"""
         invoker = SyncInvoker()
 
         def dummy():
@@ -102,20 +102,35 @@ class TestCallStack:
         # 栈应为空
         assert invoker.current_frame is None
 
-        # 压入一个栈帧
-        token = invoker._push_frame(dummy, MethodKind.SYNC, None)
-        frame = invoker.current_frame
-        assert frame is not None
-        assert frame.method_name == dummy.__qualname__
-        assert frame.method_kind == MethodKind.SYNC
-        assert frame.caller is None
+        # 进入帧作用域
+        with invoker._frame_scope(dummy, MethodKind.SYNC, None):
+            frame = invoker.current_frame
+            assert frame is not None
+            assert frame.method_name == dummy.__qualname__
+            assert frame.method_kind == MethodKind.SYNC
+            assert frame.caller is None
 
-        # 弹出栈帧
-        invoker._pop_frame(token)
+        # 离开作用域后栈应为空
+        assert invoker.current_frame is None
+
+    def test_frame_scope_exception_safety(self):
+        """_frame_scope 在异常时也应正确弹出栈帧"""
+        invoker = SyncInvoker()
+
+        def dummy():
+            pass
+
+        try:
+            with invoker._frame_scope(dummy, MethodKind.SYNC, None):
+                assert invoker.current_frame is not None
+                raise ValueError("test")
+        except ValueError:
+            pass
+
         assert invoker.current_frame is None
 
     def test_nested_frames(self):
-        """嵌套的栈帧应构成链表结构"""
+        """嵌套的帧应构成链表结构"""
         invoker = SyncInvoker()
 
         def outer():
@@ -124,19 +139,21 @@ class TestCallStack:
         def inner():
             pass
 
-        token1 = invoker._push_frame(outer, MethodKind.SYNC, None)
-        frame1 = invoker.current_frame
+        with invoker._frame_scope(outer, MethodKind.SYNC, None):
+            frame1 = invoker.current_frame
+            assert frame1.method_kind == MethodKind.SYNC
+            assert frame1.caller is None
 
-        token2 = invoker._push_frame(inner, MethodKind.ASYNC, frame1)
-        frame2 = invoker.current_frame
-        assert frame2.method_kind == MethodKind.ASYNC
-        assert frame2.caller is frame1
-        assert frame2.caller_kind == MethodKind.SYNC
+            with invoker._frame_scope(inner, MethodKind.ASYNC, frame1):
+                frame2 = invoker.current_frame
+                assert frame2.method_kind == MethodKind.ASYNC
+                assert frame2.caller is frame1
+                assert frame2.caller_kind == MethodKind.SYNC
 
-        invoker._pop_frame(token2)
-        assert invoker.current_frame is frame1
+            # 内层弹出后应回到外层
+            assert invoker.current_frame is frame1
 
-        invoker._pop_frame(token1)
+        # 外层弹出后应为空
         assert invoker.current_frame is None
 
 
