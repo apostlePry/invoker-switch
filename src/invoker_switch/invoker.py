@@ -2,14 +2,30 @@
 
 import asyncio
 import contextvars
+import functools
 import inspect
 from contextlib import contextmanager
 
-from typing_extensions import Any, Callable, Dict, Optional
+from typing_extensions import Any, Callable, Dict, Optional, Tuple
 
 from .detection import is_awaited
 from .loop import EventLoopManager
 from .types import CallFrame, MethodKind, _call_stack
+
+
+async def _to_thread(func: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
+    """asyncio.to_thread 的 Python 3.8 兼容实现
+
+    asyncio.to_thread 在 Python 3.9 才引入。
+    此实现复刻了 CPython 中 to_thread 的完整逻辑：
+    1. contextvars.copy_context() 复制当前上下文
+    2. ctx.run() 在新线程中以复制的上下文执行函数
+    确保 ContextVar 在新线程中正确可见。
+    """
+    loop = asyncio.get_running_loop()
+    ctx = contextvars.copy_context()
+    func_call = functools.partial(func, *args, **kwargs)
+    return await loop.run_in_executor(None, lambda: ctx.run(func_call))
 
 
 class SyncInvoker:
@@ -118,7 +134,7 @@ class SyncInvoker:
     def _execute_sync(
         self,
         func: Callable[..., Any],
-        args: tuple[Any, ...],
+        args: Tuple[Any, ...],
         kwargs: Dict[str, Any],
         caller: Optional[CallFrame],
     ) -> Any:
@@ -132,7 +148,7 @@ class SyncInvoker:
     async def _execute_sync_as_coro(
         self,
         func: Callable[..., Any],
-        args: tuple[Any, ...],
+        args: Tuple[Any, ...],
         kwargs: Dict[str, Any],
         caller: Optional[CallFrame],
     ) -> Any:
@@ -148,12 +164,12 @@ class SyncInvoker:
         新线程中自然会开启一条新的调用链。
         """
         with self._frame_scope(func, MethodKind.SYNC, caller):
-            return await asyncio.to_thread(func, *args, **kwargs)
+            return await _to_thread(func, *args, **kwargs)
 
     async def _execute_async(
         self,
         func: Callable[..., Any],
-        args: tuple[Any, ...],
+        args: Tuple[Any, ...],
         kwargs: Dict[str, Any],
         caller: Optional[CallFrame],
     ) -> Any:
@@ -169,7 +185,7 @@ class SyncInvoker:
     def _submit_coro(
         self,
         func: Callable[..., Any],
-        args: tuple[Any, ...],
+        args: Tuple[Any, ...],
         kwargs: Dict[str, Any],
         caller: Optional[CallFrame],
     ) -> Any:
@@ -216,6 +232,7 @@ class SyncInvoker:
         self,
         func: Callable[..., Any],
         *args: Any,
+        force_async: bool = False,
         **kwargs: Any,
     ) -> Any:
         """执行方法，自动判断类型并统一调用
@@ -224,18 +241,26 @@ class SyncInvoker:
             ASYNC 方法：
                 异步调用链 → 返回协程（_execute_async）
                 同步调用链 → 阻塞等待（_submit_coro）
-                判断依据：_is_in_async_call_chain()
+                判断依据：_is_in_async_call_chain() 或 force_async
                 原因：ASYNC 方法返回协程，只有异步调用链才能 await 它；
                       同步调用链只能阻塞等待结果。
 
             SYNC 方法：
                 有 await  → to_thread 返回协程（_execute_sync_as_coro）
                 无 await  → 直接执行（_execute_sync）
-                判断依据：is_awaited()
+                判断依据：is_awaited() 或 force_async
                 原因：SYNC 方法返回结果，用户通过 await 表达是否要异步执行。
 
             COROUTINE 类型：
                 等同 ASYNC 处理——协程对象已经是"待执行的异步结果"。
+
+        Args:
+            func: 要执行的方法
+            *args: 位置参数
+            force_async: 强制异步模式，跳过 is_awaited() 和 _is_in_async_call_chain()
+                检测，始终返回协程。适用于 arun_callable 等 async 函数内部调用
+                的场景——此时用户帧已通过 GET_AWAITABLE，字节码检测无法生效。
+            **kwargs: 关键字参数
         """
         # 1. 判断方法类型
         kind = self._get_method_kind(func)
@@ -244,7 +269,7 @@ class SyncInvoker:
 
         # ─── ASYNC / COROUTINE 方法：能否返回协程？ ───
         if kind in (MethodKind.ASYNC, MethodKind.COROUTINE):
-            if self._is_in_async_call_chain():
+            if force_async or self._is_in_async_call_chain():
                 # 异步调用链 → 可以返回协程
                 return self._execute_async(func, args, kwargs, caller)
             else:
@@ -252,7 +277,7 @@ class SyncInvoker:
                 return self._submit_coro(func, args, kwargs, caller)
 
         # ─── SYNC 方法：用户想同步还是异步执行？ ───
-        if is_awaited():
+        if force_async or is_awaited():
             # 用户写了 await → to_thread 卸载，返回协程
             return self._execute_sync_as_coro(func, args, kwargs, caller)
         else:

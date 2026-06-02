@@ -2,7 +2,7 @@
 
 from abc import ABCMeta
 
-from typing_extensions import Any, Callable, Dict
+from typing_extensions import Any, Callable, Dict, Tuple
 
 from .invoker import SyncInvoker
 
@@ -49,7 +49,7 @@ class InvokerMeta(ABCMeta):
     def __new__(
         mcs,
         name: str,
-        bases: tuple[type, ...],
+        bases: Tuple[type, ...],
         namespace: Dict[str, Any],
     ) -> "InvokerMeta":
         new_namespace: Dict[str, Any] = {}

@@ -3,7 +3,7 @@
 import dis
 import logging
 import sys
-from typing_extensions import Any, Callable, Dict, List
+from typing_extensions import Any, Callable, Dict, List, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -17,7 +17,7 @@ _WRAPPER_MARKER: str = "__invoker_wrapper__"
 # 字节码指令缓存 — 每个 code object 只解析一次
 # key 为 id(code)，value 为 (code_id, instructions) 元组
 # code_id 用于检测 id 复用导致的缓存碰撞
-_instruction_cache: Dict[int, tuple[int, List[Any]]] = {}
+_instruction_cache: Dict[int, Tuple[int, List[Any]]] = {}
 
 # 缓存容量上限 — 防止极端情况下无限增长
 _CACHE_MAX_SIZE: int = 1024

@@ -1,14 +1,18 @@
 """辅助类型定义 — 方法类型枚举、调用栈帧、模块级状态"""
 
 import contextvars
-from enum import StrEnum
+from enum import Enum
 
 from pydantic import BaseModel
 from typing_extensions import List, Optional
 
 
-class MethodKind(StrEnum):
-    """方法类型枚举"""
+class MethodKind(str, Enum):
+    """方法类型枚举
+
+    继承 str 和 Enum（而非 StrEnum）以兼容 Python 3.8。
+    StrEnum 在 Python 3.11 才引入。
+    """
 
     SYNC = "sync"  # 普通 def 方法
     ASYNC = "async"  # async def 方法
