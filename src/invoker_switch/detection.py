@@ -15,7 +15,7 @@ _PACKAGE_PREFIX: str = "invoker_switch."
 _WRAPPER_MARKER: str = "__invoker_wrapper__"
 
 # 已标记的 wrapper code object id 集合
-# _mark_wrapper() 注册，_find_caller_frame() 查询，用于可靠跳过 wrapper 帧
+# mark_wrapper() 注册，_find_caller_frame() 查询，用于可靠跳过 wrapper 帧
 # 解决的问题：
 #   1. Python 3.12+ code object 不允许 setattr，方式2（f_code 属性检测）失效
 #   2. wrapper 是闭包局部函数，方式1（f_locals/f_globals 按名查找）找不到
@@ -84,7 +84,7 @@ def _find_caller_frame() -> Any:
         depth += 1
 
 
-def _mark_wrapper(func: Callable[..., Any]) -> Callable[..., Any]:
+def mark_wrapper(func: Callable[..., Any]) -> Callable[..., Any]:
     """给装饰器 wrapper 函数打上标记，使 _find_caller_frame 能识别并跳过它
 
     用法：
@@ -92,7 +92,7 @@ def _mark_wrapper(func: Callable[..., Any]) -> Callable[..., Any]:
             @functools.wraps(func)
             def _wrapper(*args, **kwargs):
                 return _invoker.invoke(func, *args, **kwargs)
-            return _mark_wrapper(_wrapper)
+            return mark_wrapper(_wrapper)
 
     标记方式（三重保障）：
       1. code object id 注册到 _wrapped_code_ids 集合（最可靠，所有版本通用）

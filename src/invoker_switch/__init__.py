@@ -1,5 +1,6 @@
 """SyncInvoker — 统一同步/异步执行器"""
 
+from .detection import mark_wrapper
 from .invoker import SyncInvoker
 from .loop import EventLoopManager
 from .meta import InvokerBase, InvokerMeta, _invoker
@@ -23,6 +24,7 @@ __all__ = [
     # 工具
     "run_callable",
     "arun_callable",
+    "mark_wrapper",
     # 兼容旧名称
     "RpcMeta",
     "RpcBase",
