@@ -3,7 +3,7 @@
 import dis
 import logging
 import sys
-from typing_extensions import Any, Callable, Dict, List, Tuple
+from typing_extensions import Any, Callable, Dict, List, Set, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -13,6 +13,15 @@ _PACKAGE_PREFIX: str = "invoker_switch."
 # 装饰器 wrapper 标记属性名
 # smart_call 装饰器生成的 wrapper 会被打上此属性，_find_caller_frame 遇到时跳过
 _WRAPPER_MARKER: str = "__invoker_wrapper__"
+
+# 已标记的 wrapper code object id 集合
+# _mark_wrapper() 注册，_find_caller_frame() 查询，用于可靠跳过 wrapper 帧
+# 解决的问题：
+#   1. Python 3.12+ code object 不允许 setattr，方式2（f_code 属性检测）失效
+#   2. wrapper 是闭包局部函数，方式1（f_locals/f_globals 按名查找）找不到
+#   3. wrapper 定义在 invoker_switch 包外，模块归属检测不跳过
+# 只要函数存活（被装饰后持有引用），id(code) 就不会复用，查找可靠
+_wrapped_code_ids: Set[int] = set()
 
 # 字节码指令缓存 — 每个 code object 只解析一次
 # key 为 id(code)，value 为 (code_id, instructions) 元组
@@ -42,17 +51,17 @@ def _find_caller_frame() -> Any:
             # 栈帧不够深 — 没有用户代码帧
             return None
 
-        # 检查是否是装饰器 wrapper 帧（带标记的函数）
-        if frame.f_code.co_flags & 0x04:  # CO_OPTIMIZED
-            # wrapper 是局部函数，检查 f_locals 中是否有标记
-            # 更可靠的方式：检查 f_code 的属性
-            pass
+        # 方式0（最可靠）：检查 code object id 是否在已注册的 wrapper 集合中
+        # 适用于所有 Python 版本，不受 code object 不可变限制影响
+        if id(frame.f_code) in _wrapped_code_ids:
+            depth += 1
+            continue
 
         # 方式1：检查帧对应的函数对象是否有 __invoker_wrapper__ 标记
         # f_code.co_name 是函数名，但无法直接拿到函数对象
         # 所以通过 f_locals 或 f_globals 间接查找
+        # 注意：闭包局部函数无法通过此方式找到（不在 locals/globals 中）
         func_name = frame.f_code.co_name
-        # 在帧的 locals 和 globals 中查找同名函数并检查标记
         func_obj = frame.f_locals.get(func_name) or frame.f_globals.get(func_name)
         if func_obj is not None and getattr(func_obj, _WRAPPER_MARKER, False):
             # 装饰器 wrapper 帧 → 跳过
@@ -60,7 +69,7 @@ def _find_caller_frame() -> Any:
             continue
 
         # 方式2：检查帧的 f_code 上是否有标记
-        # 装饰器通过 _mark_wrapper() 给 code object 设置标记
+        # 仅在 Python <3.12（code object 允许 setattr）时有效
         if getattr(frame.f_code, _WRAPPER_MARKER, False):
             depth += 1
             continue
@@ -85,15 +94,20 @@ def _mark_wrapper(func: Callable[..., Any]) -> Callable[..., Any]:
                 return _invoker.invoke(func, *args, **kwargs)
             return _mark_wrapper(_wrapper)
 
-    标记方式：在 wrapper 的 __code__ 对象上设置 __invoker_wrapper__ = True
+    标记方式（三重保障）：
+      1. code object id 注册到 _wrapped_code_ids 集合（最可靠，所有版本通用）
+      2. 在 wrapper 的 __code__ 对象上设置属性（Python <3.12 可用）
+      3. 在 wrapper 函数对象上设置属性（备用，需配合帧查找使用）
     """
+    # 方式0：注册 code object id（最可靠，_find_caller_frame 优先使用）
+    _wrapped_code_ids.add(id(func.__code__))
+
     try:
-        # code object 正常是不可变的，但可以动态设置属性（CPython 允许）
+        # 方式2：code object 属性标记（Python <3.12 可用，3.12+ 静默失败）
         setattr(func.__code__, _WRAPPER_MARKER, True)
     except (AttributeError, TypeError):
-        # 某些实现可能不支持，降级：在函数对象上设置标记
         pass
-    # 同时在函数对象上也设置标记，作为备用
+    # 方式1/3：函数对象属性标记（备用）
     setattr(func, _WRAPPER_MARKER, True)
     return func
 
