@@ -3,12 +3,16 @@
 import dis
 import logging
 import sys
-from typing_extensions import Any, Dict, List
+from typing_extensions import Any, Callable, Dict, List
 
 logger = logging.getLogger(__name__)
 
 # 框架内部模块名前缀 — 用于栈帧归属判断，跳过框架内部帧
 _PACKAGE_PREFIX: str = "invoker_switch."
+
+# 装饰器 wrapper 标记属性名
+# smart_call 装饰器生成的 wrapper 会被打上此属性，_find_caller_frame 遇到时跳过
+_WRAPPER_MARKER: str = "__invoker_wrapper__"
 
 # 字节码指令缓存 — 每个 code object 只解析一次
 # key 为 id(code)，value 为 (code_id, instructions) 元组
@@ -20,16 +24,14 @@ _CACHE_MAX_SIZE: int = 1024
 
 
 def _find_caller_frame() -> Any:
-    """从当前栈帧向上查找，跳过所有框架内部帧，返回用户代码帧
+    """从当前栈帧向上查找，跳过所有框架内部帧和装饰器 wrapper 帧，返回用户代码帧
 
     栈帧遍历规则：
       - 跳过 is_awaited 自身（frame 0）
       - 跳过 invoke 自身（frame 1）
       - 跳过所有属于 invoker_switch 包的帧（wrapper、_submit_coro 内部的回调等）
+      - 跳过带 __invoker_wrapper__ 标记的装饰器 wrapper 帧
       - 返回第一个不属于框架的帧
-
-    优势：不依赖函数名字符串匹配，即使框架内部增加了新的中间调用层，
-    或用户代码中恰好有叫 "wrapper" 的函数，都不会误判。
     """
     # 从 frame 2 开始（跳过 is_awaited 和 invoke）
     depth = 2
@@ -40,6 +42,29 @@ def _find_caller_frame() -> Any:
             # 栈帧不够深 — 没有用户代码帧
             return None
 
+        # 检查是否是装饰器 wrapper 帧（带标记的函数）
+        if frame.f_code.co_flags & 0x04:  # CO_OPTIMIZED
+            # wrapper 是局部函数，检查 f_locals 中是否有标记
+            # 更可靠的方式：检查 f_code 的属性
+            pass
+
+        # 方式1：检查帧对应的函数对象是否有 __invoker_wrapper__ 标记
+        # f_code.co_name 是函数名，但无法直接拿到函数对象
+        # 所以通过 f_locals 或 f_globals 间接查找
+        func_name = frame.f_code.co_name
+        # 在帧的 locals 和 globals 中查找同名函数并检查标记
+        func_obj = frame.f_locals.get(func_name) or frame.f_globals.get(func_name)
+        if func_obj is not None and getattr(func_obj, _WRAPPER_MARKER, False):
+            # 装饰器 wrapper 帧 → 跳过
+            depth += 1
+            continue
+
+        # 方式2：检查帧的 f_code 上是否有标记
+        # 装饰器通过 _mark_wrapper() 给 code object 设置标记
+        if getattr(frame.f_code, _WRAPPER_MARKER, False):
+            depth += 1
+            continue
+
         # 检查帧的模块归属
         module: str = frame.f_globals.get("__name__", "")
         if not module.startswith(_PACKAGE_PREFIX):
@@ -48,6 +73,29 @@ def _find_caller_frame() -> Any:
 
         # 属于框架内部 → 继续向上查找
         depth += 1
+
+
+def _mark_wrapper(func: Callable[..., Any]) -> Callable[..., Any]:
+    """给装饰器 wrapper 函数打上标记，使 _find_caller_frame 能识别并跳过它
+
+    用法：
+        def smart_call(func):
+            @functools.wraps(func)
+            def _wrapper(*args, **kwargs):
+                return _invoker.invoke(func, *args, **kwargs)
+            return _mark_wrapper(_wrapper)
+
+    标记方式：在 wrapper 的 __code__ 对象上设置 __invoker_wrapper__ = True
+    """
+    try:
+        # code object 正常是不可变的，但可以动态设置属性（CPython 允许）
+        setattr(func.__code__, _WRAPPER_MARKER, True)
+    except (AttributeError, TypeError):
+        # 某些实现可能不支持，降级：在函数对象上设置标记
+        pass
+    # 同时在函数对象上也设置标记，作为备用
+    setattr(func, _WRAPPER_MARKER, True)
+    return func
 
 
 def is_awaited() -> bool:

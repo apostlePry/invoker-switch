@@ -36,6 +36,30 @@ async def main():
     avatar = await svc.fetch_avatar()  # 返回协程
 ```
 
+### 通过 smart_call 装饰器使用
+
+```python
+from invoker_switch import smart_call
+
+@smart_call
+def get_data(url):
+    return requests.get(url).json()   # 同步函数
+
+@smart_call
+async def fetch_data(url):
+    async with aiohttp.ClientSession() as s:
+        return await s.get(url)        # 异步函数
+
+# 同步环境 — 统一阻塞等待结果
+data = get_data("/api")         # 直接执行
+data = fetch_data("/api")       # 自动提交到事件循环
+
+# 异步环境 — 支持 await
+async def handler():
+    data = await get_data("/api")      # 自动 to_thread
+    data = await fetch_data("/api")    # 直接 await
+```
+
 ### 通过 run_callable 函数式使用
 
 ```python
@@ -100,16 +124,16 @@ svc = Service()
 result = svc.entry()  # → "async->done"
 ```
 
-### 两种使用方式对比
+### 三种使用方式对比
 
-| 特性 | `InvokerBase` 声明式 | `run_callable` / `arun_callable` 函数式 |
-|------|----------------------|--------------------------------------|
-| 使用方式 | 继承基类，方法自动桥接 | 逐个函数调用 |
-| 同步/异步模式 | 自动适配 | `await` 控制 / `arun_callable` 显式异步 |
-| await 感知 | ✓ 字节码级检测 | `run_callable` 支持检测，`arun_callable` 显式异步 |
-| 调用栈追踪 | ✓ 完整 CallFrame 链 | ✗ 无调用栈 |
-| 重入死锁防护 | ✓ 完整防护 | ✗ 无防护 |
-| 适用场景 | 服务类、长期维护的代码 | 简单调用、一次性桥接 |
+| 特性 | `InvokerBase` 声明式 | `smart_call` 装饰器 | `run_callable` / `arun_callable` |
+|------|----------------------|---------------------|----------------------------------|
+| 使用方式 | 继承基类，方法自动桥接 | 装饰器包装单个函数 | 逐个函数调用 |
+| 同步/异步模式 | 自动适配 | 自动适配 | `await` 控制 / `arun_callable` |
+| await 感知 | ✓ 字节码级检测 | ✓ 字节码级检测 | `run_callable` 支持，`arun_callable` 显式 |
+| 调用栈追踪 | ✓ 完整 CallFrame 链 | ✓ 完整 CallFrame 链 | ✗ 无调用栈 |
+| 重入死锁防护 | ✓ 完整防护 | ✓ 完整防护 | ✗ 无防护 |
+| 适用场景 | 服务类、长期维护的代码 | 独立函数、工具方法 | 简单调用、一次性桥接 |
 
 ## API
 
@@ -121,6 +145,7 @@ result = svc.entry()  # → "async->done"
 
 ### 工具
 
+- **`smart_call(func)`** — 装饰器，自动桥接同步/异步调用，内部使用 SyncInvoker
 - **`run_callable(func, *args, **kwargs)`** — 统一执行工具，由用户通过 `await` 控制模式
   - 无 `await`：同步模式，直接返回结果（异步函数自动提交到事件循环阻塞等待）
   - 有 `await`：异步模式，返回协程（同步函数通过 `to_thread` 执行）
@@ -148,7 +173,7 @@ src/invoker_switch/
 ├── loop.py          # EventLoopManager 事件循环管理
 ├── invoker.py       # SyncInvoker 核心执行器
 ├── meta.py          # InvokerMeta 元类, InvokerBase 基类
-└── utils.py         # run_callable 统一执行工具
+└── utils.py         # smart_call, run_callable, arun_callable
 ```
 
 ## 开发

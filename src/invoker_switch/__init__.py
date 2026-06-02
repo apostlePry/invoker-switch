@@ -4,7 +4,7 @@ from .invoker import SyncInvoker
 from .loop import EventLoopManager
 from .meta import InvokerBase, InvokerMeta, _invoker
 from .types import CallFrame, MethodKind
-from .utils import arun_callable, run_callable
+from .utils import arun_callable, run_callable, smart_call
 
 # 兼容旧名称（已弃用，将在未来版本移除）
 RpcMeta = InvokerMeta
@@ -23,6 +23,7 @@ __all__ = [
     # 工具
     "run_callable",
     "arun_callable",
+    "smart_call",
     # 兼容旧名称
     "RpcMeta",
     "RpcBase",

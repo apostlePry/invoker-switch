@@ -1,11 +1,15 @@
 """轻量级统一执行工具 — 同步/异步双模式，由用户显式选择"""
 
 import asyncio
+import functools
 
-from typing_extensions import Any, Callable
+from typing_extensions import Any, Callable, TypeVar
 
-from .detection import is_awaited
+from .detection import _mark_wrapper, is_awaited
 from .loop import EventLoopManager
+from .meta import _invoker
+
+T = TypeVar("T")
 
 
 async def arun_callable(func: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
@@ -85,3 +89,41 @@ def run_callable(func: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
     else:
         # 同步函数 → to_thread 卸载，返回协程
         return asyncio.to_thread(func, *args, **kwargs)
+
+
+def smart_call(func: Callable[..., T]) -> Callable[..., T]:
+    """装饰器：自动桥接同步/异步调用，让函数在任何上下文中都能正确执行
+
+    用法：
+        @smart_call
+        def my_sync_func(x):
+            return x * 2
+
+        @smart_call
+        async def my_async_func(x):
+            return x * 2
+
+    行为：
+        同步调用链中调用 → 阻塞等待结果（async 函数自动提交到事件循环）
+        异步调用链中调用 → 返回协程（sync 函数自动卸载到线程池）
+
+    与 InvokerBase 的区别：
+        - InvokerBase：通过元类自动包装所有方法，需要继承基类
+        - smart_call：通过装饰器包装单个函数，无需继承，更灵活
+
+    两者内部都使用 SyncInvoker.invoke() 作为执行引擎，决策逻辑完全一致。
+
+    Args:
+        func: 要包装的函数，可以是同步或异步
+
+    Returns:
+        包装后的函数，在任何上下文中都能正确执行
+    """
+
+    @functools.wraps(func)
+    def _wrapper(*args: Any, **kwargs: Any) -> Any:
+        return _invoker.invoke(func, *args, **kwargs)
+
+    # 打上标记，让 _find_caller_frame 能识别并跳过此帧
+    _mark_wrapper(_wrapper)
+    return _wrapper
