@@ -13,7 +13,7 @@ from .loop import EventLoopManager
 from .types import CallFrame, MethodKind, _call_stack
 
 
-async def _to_thread(func: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
+async def _to_thread(func: Callable[..., Any], *args: Tuple, **kwargs: Dict) -> Any:
     """asyncio.to_thread 的 Python 3.8 兼容实现
 
     asyncio.to_thread 在 Python 3.9 才引入。
@@ -22,7 +22,7 @@ async def _to_thread(func: Callable[..., Any], *args: Any, **kwargs: Any) -> Any
     2. ctx.run() 在新线程中以复制的上下文执行函数
     确保 ContextVar 在新线程中正确可见。
     """
-    loop = asyncio.get_running_loop()
+    loop = EventLoopManager.get_event_loop()
     ctx = contextvars.copy_context()
     func_call = functools.partial(func, *args, **kwargs)
     return await loop.run_in_executor(None, lambda: ctx.run(func_call))
@@ -115,8 +115,8 @@ class SyncInvoker:
             _call_stack.reset(token)
 
     # ─── 协程执行辅助 ───
-
-    async def _invoke_coro(self, func: Callable[..., Any], args: tuple, kwargs: dict) -> Any:
+    @classmethod
+    async def _invoke_coro(cls, func: Callable[..., Any], args: tuple, kwargs: dict) -> Any:
         """执行协程对象，兼容 ASYNC 函数和 COROUTINE 对象
 
         ASYNC 函数：await func(*args, **kwargs) — 调用函数获得协程，再 await
@@ -126,8 +126,9 @@ class SyncInvoker:
             # 协程对象已经是"待执行的异步结果"，直接 await
             # 不能再传 args/kwargs——对协程对象调用 func(*args) 会创建新协程
             return await func
-        else:
+        if inspect.iscoroutinefunction(func):
             return await func(*args, **kwargs)
+        return await _to_thread(func, *args, **kwargs)
 
     # ─── 直接执行（异步调用链中） ───
 
@@ -203,6 +204,10 @@ class SyncInvoker:
         修改在协程所在的事件循环线程中可见，但不会自动传播回调用线程。
         对于大多数场景（只读 ContextVar）这是足够的。
         """
+        if inspect.isfunction(func):
+            with self._frame_scope(func, MethodKind.SYNC, caller):
+                return func(*args, **kwargs)
+
         loop = EventLoopManager.get_event_loop()
 
         # 安全检查：当前线程是否是事件循环线程
@@ -223,7 +228,7 @@ class SyncInvoker:
             with self._frame_scope(func, MethodKind.ASYNC, caller):
                 return await self._invoke_coro(func, args, kwargs)
 
-        future = asyncio.run_coroutine_threadsafe(_wrapper(), loop)
+        future = asyncio.run_coroutine_threadsafe(self._execute_async(func, args, kwargs, caller), loop)
         return future.result()
 
     # ─── 统一入口 ───
@@ -279,7 +284,7 @@ class SyncInvoker:
         # ─── SYNC 方法：用户想同步还是异步执行？ ───
         if force_async or is_awaited():
             # 用户写了 await → to_thread 卸载，返回协程
-            return self._execute_sync_as_coro(func, args, kwargs, caller)
+            return self._execute_async(func, args, kwargs, caller)
         else:
             # 用户没写 await → 直接执行
             return self._execute_sync(func, args, kwargs, caller)
