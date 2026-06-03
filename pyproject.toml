@@ -23,5 +23,6 @@ build-backend = "hatchling.build"
 packages = ["src/invoker_switch"]
 
 [tool.pytest.ini_options]
+addopts = "-s"
 asyncio_mode = "auto"
 testpaths = ["tests"]
