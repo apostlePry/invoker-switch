@@ -22,7 +22,7 @@ def smart_call(func: Callable):
 
 @smart_call
 async def demo():
-    print("Execute demo function!")
+    print("Execute demo function! demo in thread: {}".format(threading.current_thread().name))
     await asyncio.sleep(1)
     return "Demo completed"
 
@@ -58,3 +58,8 @@ def test_context_run_with_sync():
     result = world()
     assert result
     print(result)
+
+
+def test_run_sync_func():
+    tmp_result = func_demo()
+    assert tmp_result
