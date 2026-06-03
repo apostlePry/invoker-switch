@@ -53,17 +53,17 @@ class SyncInvoker:
         return stack[-1]
 
     # ─── 上下文判断 ───
-
-    def _get_method_kind(self, func: Callable[..., Any]) -> MethodKind:
+    @classmethod
+    def _get_method_kind(cls, func: Callable[..., Any]) -> MethodKind:
         """判断方法类型
 
         检查 __wrapped__：InvokerMeta 包装后的方法保留了原始方法引用。
         如果不解包，所有方法都会被判断为 SYNC（因为 wrapper 本身是同步函数）。
         """
         original = getattr(func, "__wrapped__", func)
-        target = original if asyncio.iscoroutinefunction(original) else func
+        target = original if inspect.iscoroutinefunction(original) else func
 
-        if asyncio.iscoroutinefunction(target):
+        if inspect.iscoroutinefunction(target):
             return MethodKind.ASYNC
         if inspect.iscoroutine(func):
             return MethodKind.COROUTINE
@@ -178,7 +178,8 @@ class SyncInvoker:
 
         适用场景：异步调用链 + 异步方法 / 协程对象
         """
-        with self._frame_scope(func, MethodKind.ASYNC, caller):
+        method_kind = self._get_method_kind(func)
+        with self._frame_scope(func, method_kind, caller):
             return await self._invoke_coro(func, args, kwargs)
 
     # ─── 阻塞等待（同步调用链中） ───
