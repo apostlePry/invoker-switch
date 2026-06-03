@@ -18,7 +18,7 @@ _WRAPPER_MARKER: str = "__invoker_wrapper__"
 # mark_wrapper() 注册，_find_caller_frame() 查询，用于可靠跳过 wrapper 帧
 # 解决的问题：
 #   1. Python 3.12+ code object 不允许 setattr，方式2（f_code 属性检测）失效
-#   2. wrapper 是闭包局部函数，方式1（f_locals/f_globals 按名查找）找不到
+#   2. wrapper 是闭包局部函数，f_locals/f_globals 按名查找找不到
 #   3. wrapper 定义在 invoker_switch 包外，模块归属检测不跳过
 # 只要函数存活（被装饰后持有引用），id(code) 就不会复用，查找可靠
 _wrapped_code_ids: Set[int] = set()
@@ -39,7 +39,7 @@ def _find_caller_frame() -> Any:
       - 跳过 is_awaited 自身（frame 0）
       - 跳过 invoke 自身（frame 1）
       - 跳过所有属于 invoker_switch 包的帧（wrapper、_submit_coro 内部的回调等）
-      - 跳过带 __invoker_wrapper__ 标记的装饰器 wrapper 帧
+      - 跳过 mark_wrapper 注册的装饰器 wrapper 帧（通过 code object id 检测）
       - 返回第一个不属于框架的帧
     """
     # 从 frame 2 开始（跳过 is_awaited 和 invoke）
@@ -54,17 +54,6 @@ def _find_caller_frame() -> Any:
         # 方式0（最可靠）：检查 code object id 是否在已注册的 wrapper 集合中
         # 适用于所有 Python 版本，不受 code object 不可变限制影响
         if id(frame.f_code) in _wrapped_code_ids:
-            depth += 1
-            continue
-
-        # 方式1：检查帧对应的函数对象是否有 __invoker_wrapper__ 标记
-        # f_code.co_name 是函数名，但无法直接拿到函数对象
-        # 所以通过 f_locals 或 f_globals 间接查找
-        # 注意：闭包局部函数无法通过此方式找到（不在 locals/globals 中）
-        func_name = frame.f_code.co_name
-        func_obj = frame.f_locals.get(func_name) or frame.f_globals.get(func_name)
-        if func_obj is not None and getattr(func_obj, _WRAPPER_MARKER, False):
-            # 装饰器 wrapper 帧 → 跳过
             depth += 1
             continue
 
@@ -94,10 +83,14 @@ def mark_wrapper(func: Callable[..., Any]) -> Callable[..., Any]:
                 return _invoker.invoke(func, *args, **kwargs)
             return mark_wrapper(_wrapper)
 
-    标记方式（三重保障）：
+    标记方式（双重保障）：
       1. code object id 注册到 _wrapped_code_ids 集合（最可靠，所有版本通用）
       2. 在 wrapper 的 __code__ 对象上设置属性（Python <3.12 可用）
-      3. 在 wrapper 函数对象上设置属性（备用，需配合帧查找使用）
+
+    注意：不再通过函数对象属性 (__invoker_wrapper__) 进行帧检测。
+          该属性仍会被设置以保持向后兼容，但 _find_caller_frame 不再使用它，
+          因为 f_locals/f_globals 按名查找可能找到装饰后的 wrapper 函数而非帧中
+          实际执行的原始函数，导致用户代码帧被误判为 wrapper 帧而跳过。
     """
     # 方式0：注册 code object id（最可靠，_find_caller_frame 优先使用）
     _wrapped_code_ids.add(id(func.__code__))
@@ -107,7 +100,8 @@ def mark_wrapper(func: Callable[..., Any]) -> Callable[..., Any]:
         setattr(func.__code__, _WRAPPER_MARKER, True)
     except (AttributeError, TypeError):
         pass
-    # 方式1/3：函数对象属性标记（备用）
+    # 保留函数对象属性标记（向后兼容：外部代码可能检查此属性）
+    # 注意：_find_caller_frame 不再使用此属性进行帧检测
     setattr(func, _WRAPPER_MARKER, True)
     return func
 
