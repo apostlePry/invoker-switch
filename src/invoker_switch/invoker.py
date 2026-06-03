@@ -204,7 +204,7 @@ class SyncInvoker:
         修改在协程所在的事件循环线程中可见，但不会自动传播回调用线程。
         对于大多数场景（只读 ContextVar）这是足够的。
         """
-        if inspect.isfunction(func):
+        if not inspect.iscoroutinefunction(func) and not inspect.iscoroutine(func):
             with self._frame_scope(func, MethodKind.SYNC, caller):
                 return func(*args, **kwargs)
 
@@ -287,4 +287,4 @@ class SyncInvoker:
             return self._execute_async(func, args, kwargs, caller)
         else:
             # 用户没写 await → 直接执行
-            return self._execute_sync(func, args, kwargs, caller)
+            return self._submit_coro(func, args, kwargs, caller)
