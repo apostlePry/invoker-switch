@@ -146,28 +146,24 @@ class TestStats:
     """stats 属性测试"""
 
     def test_stats_structure(self):
-        """stats 属性返回正确的结构"""
+        """stats 属性返回 ExecutorStats 数据类"""
         with AdaptiveExecutor(core_workers=4, max_workers=16, keep_alive=30.0) as executor:
             stats = executor.stats
-            assert "active_threads" in stats
-            assert "core_workers" in stats
-            assert "max_workers" in stats
-            assert "pending_tasks" in stats
-            assert "keep_alive" in stats
-            assert stats["core_workers"] == 4
-            assert stats["max_workers"] == 16
-            assert stats["keep_alive"] == 30.0
+            assert isinstance(stats, ExecutorStats)
+            assert stats.core_workers == 4
+            assert stats.max_workers == 16
+            assert stats.keep_alive == 30.0
 
     def test_stats_updates_with_load(self):
         """stats 反映实际负载"""
         with AdaptiveExecutor(core_workers=2, max_workers=8) as executor:
             stats_before = executor.stats
-            assert stats_before["active_threads"] == 0
+            assert stats_before.active_threads == 0
 
             futures = [executor.submit(time.sleep, 0.2) for _ in range(6)]
             time.sleep(0.1)
             stats_during = executor.stats
-            assert stats_during["active_threads"] > 0
+            assert stats_during.active_threads > 0
 
             for f in futures:
                 f.result()
@@ -275,5 +271,5 @@ class TestBoundedQueue:
         """stats 包含队列容量和拒绝计数"""
         with AdaptiveExecutor(core_workers=4, max_workers=16, queue_capacity=100) as executor:
             stats = executor.stats
-            assert stats["queue_capacity"] == 100
-            assert stats["rejected_count"] == 0
+            assert stats.queue_capacity == 100
+            assert stats.rejected_count == 0

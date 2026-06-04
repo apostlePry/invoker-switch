@@ -10,6 +10,7 @@ import queue
 import threading
 import time
 import weakref
+from dataclasses import dataclass
 
 from concurrent.futures import ThreadPoolExecutor, _base
 
@@ -21,6 +22,41 @@ from typing_extensions import Any, Callable, Dict, List, Optional
 _threads_queues: Dict[threading.Thread, queue.SimpleQueue] = weakref.WeakKeyDictionary()
 _shutdown: bool = False
 _global_shutdown_lock: threading.Lock = threading.Lock()
+
+
+# ─── 监控指标数据类 ───
+
+@dataclass(frozen=True)
+class ExecutorStats:
+    """线程池运行状态快照
+
+    Attributes:
+        active_threads:   当前活跃线程数（核心+临时）
+        core_workers:     核心线程数配置
+        max_workers:      最大线程数配置
+        pending_tasks:    队列中等待执行的任务数
+        keep_alive:       临时线程空闲超时（秒）
+        queue_capacity:   队列容量（0=无界）
+        submitted_count:  累计提交任务数
+        completed_count:  累计完成任务数
+        failed_count:     累计失败任务数
+        rejected_count:   累计拒绝任务数
+        avg_elapsed:      任务平均执行耗时（秒）
+        utilization:      线程利用率（活跃线程/最大线程数）
+    """
+
+    active_threads: int
+    core_workers: int
+    max_workers: int
+    pending_tasks: int
+    keep_alive: float
+    queue_capacity: int
+    submitted_count: int
+    completed_count: int
+    failed_count: int
+    rejected_count: int
+    avg_elapsed: float
+    utilization: float
 
 
 # ─── 拒绝策略 ───
@@ -439,23 +475,8 @@ class AdaptiveExecutor(ThreadPoolExecutor):
     # ─── 监控指标 ───
 
     @property
-    def stats(self) -> Dict[str, Any]:
-        """当前线程池状态（用于监控/调试）
-
-        指标说明：
-            active_threads:   当前活跃线程数（核心+临时）
-            core_workers:     核心线程数配置
-            max_workers:      最大线程数配置
-            pending_tasks:    队列中等待执行的任务数
-            keep_alive:       临时线程空闲超时（秒）
-            queue_capacity:   队列容量（0=无界）
-            submitted_count:  累计提交任务数
-            completed_count:  累计完成任务数
-            failed_count:     累计失败任务数
-            rejected_count:   累计拒绝任务数
-            avg_elapsed:      任务平均执行耗时（秒）
-            utilization:      线程利用率（活跃线程/最大线程数）
-        """
+    def stats(self) -> ExecutorStats:
+        """当前线程池状态快照（用于监控/调试）"""
         with self._stats_lock:
             submitted = self._submitted_count
             completed = self._completed_count
@@ -466,20 +487,20 @@ class AdaptiveExecutor(ThreadPoolExecutor):
         active = len(self._threads)
         avg_elapsed = total_elapsed / completed if completed > 0 else 0.0
 
-        return {
-            "active_threads": active,
-            "core_workers": self._core_workers,
-            "max_workers": self._max_workers,
-            "pending_tasks": self._work_queue.qsize(),
-            "keep_alive": self._keep_alive,
-            "queue_capacity": self._queue_capacity,
-            "submitted_count": submitted,
-            "completed_count": completed,
-            "failed_count": failed,
-            "rejected_count": rejected,
-            "avg_elapsed": round(avg_elapsed, 6),
-            "utilization": round(active / self._max_workers, 4) if self._max_workers > 0 else 0.0,
-        }
+        return ExecutorStats(
+            active_threads=active,
+            core_workers=self._core_workers,
+            max_workers=self._max_workers,
+            pending_tasks=self._work_queue.qsize(),
+            keep_alive=self._keep_alive,
+            queue_capacity=self._queue_capacity,
+            submitted_count=submitted,
+            completed_count=completed,
+            failed_count=failed,
+            rejected_count=rejected,
+            avg_elapsed=round(avg_elapsed, 6),
+            utilization=round(active / self._max_workers, 4) if self._max_workers > 0 else 0.0,
+        )
 
     def reset_stats(self) -> None:
         """重置累计监控指标（不影响 active_threads、pending_tasks 等实时指标）"""

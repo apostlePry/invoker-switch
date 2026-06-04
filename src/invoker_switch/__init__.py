@@ -3,6 +3,7 @@
 from .detection import mark_wrapper
 from .executor import (
     AdaptiveExecutor,
+    ExecutorStats,
     RejectedExecutionError,
     reject_abort,
     reject_caller_runs,
@@ -23,6 +24,7 @@ __all__ = [
     # 核心
     "SyncInvoker",
     "AdaptiveExecutor",
+    "ExecutorStats",
     "RejectedExecutionError",
     "reject_abort",
     "reject_caller_runs",
