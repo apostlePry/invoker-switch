@@ -8,11 +8,12 @@
 
 import queue
 import threading
+import time
 import weakref
 
 from concurrent.futures import ThreadPoolExecutor, _base
 
-from typing_extensions import Any, Callable, Dict
+from typing_extensions import Any, Callable, Dict, List, Optional
 
 
 # ─── 模块级全局状态 ───
@@ -83,16 +84,7 @@ def _worker_core(
     initializer: Any,
     initargs: tuple,
 ) -> None:
-    """核心线程 worker — 无空闲超时，永远存活等待新任务
-
-    与标准库 _worker 的区别：
-      标准 _worker 用 work_queue.get(block=True) 无限等待，
-      但没有区分核心/临时线程的概念。
-
-      本 worker 是核心线程的专属逻辑：
-      - 从队列取任务时无限等待（不超时退出）
-      - 只有 executor shutdown 或 interpreter shutdown 时才退出
-    """
+    """核心线程 worker — 无空闲超时，永远存活等待新任务"""
     if initializer is not None:
         try:
             initializer(*initargs)
@@ -105,31 +97,26 @@ def _worker_core(
 
     try:
         while True:
-            # 先尝试无阻塞取任务（快速路径）
             try:
                 work_item = work_queue.get_nowait()
             except queue.Empty:
-                # 队列空 → 通知 idle_semaphore（有空闲线程了）
                 executor = executor_reference()
                 if executor is not None:
                     executor._idle_semaphore.release()
                 del executor
-                # 核心线程：无限等待新任务
                 work_item = work_queue.get(block=True)
 
             if work_item is not None:
-                work_item.run()
+                _run_work_item(executor_reference, work_item)
                 del work_item
                 continue
 
-            # work_item is None → shutdown 信号
+            # shutdown 信号
             executor = executor_reference()
             if _shutdown or executor is None or executor._shutdown:
                 if executor is not None:
                     executor._shutdown = True
-                # 通知其他 worker 退出
                 work_queue.put(None)
-            # shutdown 时也要从 threads 中移除
             if executor is not None:
                 with executor._shutdown_lock:
                     executor._threads.discard(threading.current_thread())
@@ -150,12 +137,7 @@ def _worker_temporary(
     initializer: Any,
     initargs: tuple,
 ) -> None:
-    """临时线程 worker — 空闲超过 keep_alive 秒后自动退出
-
-    与核心线程的区别：
-      - 队列空时用 work_queue.get(block=True, timeout=keep_alive) 等待
-      - 超时后从 executor._threads 中移除自己并退出
-    """
+    """临时线程 worker — 空闲超过 keep_alive 秒后自动退出"""
     if initializer is not None:
         try:
             initializer(*initargs)
@@ -164,7 +146,6 @@ def _worker_temporary(
             executor = executor_reference()
             if executor is not None:
                 executor._initializer_failed()
-            # 临时线程初始化失败也要从 threads 中移除
             if executor is not None:
                 executor._threads.discard(threading.current_thread())
             return
@@ -173,42 +154,34 @@ def _worker_temporary(
 
     try:
         while True:
-            # 先尝试无阻塞取任务（快速路径）
             try:
                 work_item = work_queue.get_nowait()
             except queue.Empty:
-                # 队列空 → 通知 idle_semaphore
                 executor = executor_reference()
                 if executor is not None:
                     executor._idle_semaphore.release()
                 del executor
-                # 临时线程：等待新任务，超时后退出
                 try:
                     work_item = work_queue.get(block=True, timeout=keep_alive)
                 except queue.Empty:
-                    # 空闲超时 → 从 threads 中移除自己并退出
                     executor = executor_reference()
                     if executor is not None:
                         with executor._shutdown_lock:
                             executor._threads.discard(current_thread)
-                    # 通知 _adjust_thread_count 有线程退出了
-                    # 通过释放一个 semaphore 信号让下次 submit 时能感知
                     del executor
                     return
 
             if work_item is not None:
-                work_item.run()
+                _run_work_item(executor_reference, work_item)
                 del work_item
                 continue
 
-            # work_item is None → shutdown 信号
+            # shutdown 信号
             executor = executor_reference()
             if _shutdown or executor is None or executor._shutdown:
                 if executor is not None:
                     executor._shutdown = True
-                # 通知其他 worker 退出
                 work_queue.put(None)
-            # shutdown 时也要从 threads 中移除
             if executor is not None:
                 with executor._shutdown_lock:
                     executor._threads.discard(current_thread)
@@ -216,11 +189,27 @@ def _worker_temporary(
             return
     except BaseException:
         _base.LOGGER.critical("Exception in temporary worker:", exc_info=True)
-        # 异常退出也要从 threads 中移除
         executor = executor_reference()
         if executor is not None:
             with executor._shutdown_lock:
                 executor._threads.discard(current_thread)
+
+
+def _run_work_item(executor_reference: Any, work_item: Any) -> None:
+    """执行工作项，并更新监控指标和触发回调"""
+    executor = executor_reference()
+    start_time = time.monotonic()
+
+    try:
+        work_item.run()
+    finally:
+        elapsed = time.monotonic() - start_time
+        if executor is not None:
+            with executor._stats_lock:
+                executor._completed_count += 1
+                executor._total_elapsed += elapsed
+            # 触发完成回调
+            executor._fire_callback('on_complete', work_item, elapsed)
 
 
 class AdaptiveExecutor(ThreadPoolExecutor):
@@ -239,6 +228,11 @@ class AdaptiveExecutor(ThreadPoolExecutor):
         reject_caller_runs:    由提交线程自己执行（背压）
         reject_discard:        静默丢弃
         reject_discard_oldest: 丢弃队列中最旧的任务
+
+    回调钩子：
+        on_submit:    任务提交时触发
+        on_complete:  任务完成时触发
+        on_reject:    任务被拒绝时触发
 
     扩缩策略：
         1. 提交任务时，优先唤醒空闲核心线程
@@ -261,7 +255,6 @@ class AdaptiveExecutor(ThreadPoolExecutor):
             raise ValueError(
                 f"max_workers ({max_workers}) must be >= core_workers ({core_workers})"
             )
-        # 父类的 _max_workers 设为 max_workers（上限）
         super().__init__(
             max_workers=max_workers,
             thread_name_prefix=thread_name_prefix,
@@ -272,11 +265,56 @@ class AdaptiveExecutor(ThreadPoolExecutor):
         self._keep_alive = keep_alive
         self._queue_capacity = queue_capacity
         self._rejection_policy = rejection_policy
+
+        # 监控指标
+        self._stats_lock = threading.Lock()
+        self._submitted_count = 0
+        self._completed_count = 0
+        self._failed_count = 0
         self._rejected_count = 0
+        self._total_elapsed = 0.0
+
+        # 回调钩子
+        self._callbacks: Dict[str, List[Callable]] = {
+            'on_submit': [],
+            'on_complete': [],
+            'on_reject': [],
+        }
 
         # 替换父类的无界 SimpleQueue 为有界 Queue
         if queue_capacity > 0:
             self._work_queue = queue.Queue(maxsize=queue_capacity)
+
+    # ─── 回调钩子 ───
+
+    def add_callback(self, event: str, callback: Callable) -> None:
+        """注册回调钩子
+
+        Args:
+            event: 事件名称，可选 on_submit / on_complete / on_reject
+            callback: 回调函数，签名取决于事件类型：
+                on_submit(executor, func, args, kwargs)
+                on_complete(executor, work_item, elapsed)
+                on_reject(executor, func, args, kwargs)
+        """
+        if event not in self._callbacks:
+            raise ValueError(f"Unknown event: {event}, must be one of {list(self._callbacks.keys())}")
+        self._callbacks[event].append(callback)
+
+    def remove_callback(self, event: str, callback: Callable) -> None:
+        """移除回调钩子"""
+        if event in self._callbacks and callback in self._callbacks[event]:
+            self._callbacks[event].remove(callback)
+
+    def _fire_callback(self, event: str, *args, **kwargs) -> None:
+        """触发回调（不阻塞主流程，异常只记录不抛出）"""
+        for cb in self._callbacks.get(event, []):
+            try:
+                cb(self, *args, **kwargs)
+            except Exception:
+                _base.LOGGER.exception(f"Exception in {event} callback:")
+
+    # ─── 任务提交 ───
 
     def submit(self, fn, /, *args, **kwargs):
         """提交任务，队列满时触发拒绝策略"""
@@ -284,42 +322,55 @@ class AdaptiveExecutor(ThreadPoolExecutor):
             if self._shutdown:
                 raise RuntimeError("cannot schedule new futures after shutdown")
 
-            # 创建 Future 和 WorkItem
             f = _base.Future()
-            w = _base.WorkItem(f, fn, args, kwargs)
+            from concurrent.futures.thread import _WorkItem
+            w = _WorkItem(f, fn, args, kwargs)
+
+            # 注册 Future 完成回调，追踪失败数
+            f.add_done_callback(self._on_future_done)
+
+            # 更新提交计数
+            with self._stats_lock:
+                self._submitted_count += 1
 
             # 有界队列：尝试入队，满则触发拒绝策略
             if self._queue_capacity > 0:
                 try:
                     self._work_queue.put_nowait(w)
                 except queue.Full:
-                    self._rejected_count += 1
+                    with self._stats_lock:
+                        self._rejected_count += 1
+                    # 触发拒绝回调
+                    self._fire_callback('on_reject', fn, args, kwargs)
                     result = self._rejection_policy(self, fn, args, kwargs)
-                    # reject_caller_runs 返回结果，需要包装成 Future
                     if result is not None and not isinstance(result, _base.Future):
                         f.set_result(result)
                         return f
-                    # reject_discard 返回 None，返回一个已取消的 Future
                     if result is None:
                         f.cancel()
                         return f
                     return result
             else:
-                # 无界队列：直接入队（兼容旧行为）
                 self._work_queue.put(w)
+
+            # 触发提交回调
+            self._fire_callback('on_submit', fn, args, kwargs)
 
             self._adjust_thread_count()
             return f
 
-    def _adjust_thread_count(self) -> None:
-        """替换父类的线程创建策略，区分核心线程和临时线程
+    # ─── 内部回调 ───
 
-        规则：
-            1. 有空闲线程 → 唤醒它，不新建
-            2. 线程数 < core_workers → 创建核心线程（永不超时）
-            3. 线程数 >= core_workers + 有排队任务 + 未达上限 → 创建临时线程
-        """
-        # 有空闲线程 → 唤醒它，不新建
+    def _on_future_done(self, future: _base.Future) -> None:
+        """Future 完成回调，追踪失败数"""
+        if future.exception() is not None:
+            with self._stats_lock:
+                self._failed_count += 1
+
+    # ─── 线程管理 ───
+
+    def _adjust_thread_count(self) -> None:
+        """替换父类的线程创建策略，区分核心线程和临时线程"""
         if self._idle_semaphore.acquire(timeout=0):
             return
 
@@ -327,20 +378,12 @@ class AdaptiveExecutor(ThreadPoolExecutor):
         pending = self._work_queue.qsize()
 
         if num_threads < self._core_workers:
-            # 核心线程未满 → 创建核心线程
             self._spawn_worker(timeout=None)
         elif pending > 0 and num_threads < self._max_workers:
-            # 核心线程满了 + 有排队任务 + 未达上限 → 创建临时线程
             self._spawn_worker(timeout=self._keep_alive)
 
     def _spawn_worker(self, timeout: float = None) -> None:
-        """创建工作线程
-
-        Args:
-            timeout: 空闲超时时间。None 表示核心线程（永不超时退出），
-                     有值表示临时线程（超时后退出）。
-        """
-        # executor 被回收时的回调 — 向队列发送 None 信号通知 worker 退出
+        """创建工作线程"""
         def weakref_cb(_, q=self._work_queue):
             q.put(None)
 
@@ -371,14 +414,9 @@ class AdaptiveExecutor(ThreadPoolExecutor):
         _threads_queues[t] = self._work_queue
 
     def shutdown(self, wait=True, *, cancel_futures=False):
-        """关闭线程池，等待所有工作线程退出
-
-        重写父类方法，修复 _threads 在迭代期间被修改的问题
-        （临时线程退出时会从 _threads 中移除自己）
-        """
+        """关闭线程池，等待所有工作线程退出"""
         with self._shutdown_lock:
             self._shutdown = True
-        # 向队列发送退出信号，数量等于当前线程数
         threads_count = len(self._threads)
         for _ in range(threads_count):
             try:
@@ -387,7 +425,6 @@ class AdaptiveExecutor(ThreadPoolExecutor):
                 pass
 
         if wait:
-            # 等待所有线程退出，使用快照避免迭代期间修改
             while True:
                 with self._shutdown_lock:
                     threads = list(self._threads)
@@ -399,15 +436,56 @@ class AdaptiveExecutor(ThreadPoolExecutor):
                     if not self._threads:
                         break
 
+    # ─── 监控指标 ───
+
     @property
     def stats(self) -> Dict[str, Any]:
-        """当前线程池状态（用于监控/调试）"""
+        """当前线程池状态（用于监控/调试）
+
+        指标说明：
+            active_threads:   当前活跃线程数（核心+临时）
+            core_workers:     核心线程数配置
+            max_workers:      最大线程数配置
+            pending_tasks:    队列中等待执行的任务数
+            keep_alive:       临时线程空闲超时（秒）
+            queue_capacity:   队列容量（0=无界）
+            submitted_count:  累计提交任务数
+            completed_count:  累计完成任务数
+            failed_count:     累计失败任务数
+            rejected_count:   累计拒绝任务数
+            avg_elapsed:      任务平均执行耗时（秒）
+            utilization:      线程利用率（活跃线程/最大线程数）
+        """
+        with self._stats_lock:
+            submitted = self._submitted_count
+            completed = self._completed_count
+            failed = self._failed_count
+            rejected = self._rejected_count
+            total_elapsed = self._total_elapsed
+
+        active = len(self._threads)
+        avg_elapsed = total_elapsed / completed if completed > 0 else 0.0
+
         return {
-            "active_threads": len(self._threads),
+            "active_threads": active,
             "core_workers": self._core_workers,
             "max_workers": self._max_workers,
             "pending_tasks": self._work_queue.qsize(),
             "keep_alive": self._keep_alive,
             "queue_capacity": self._queue_capacity,
-            "rejected_count": self._rejected_count,
+            "submitted_count": submitted,
+            "completed_count": completed,
+            "failed_count": failed,
+            "rejected_count": rejected,
+            "avg_elapsed": round(avg_elapsed, 6),
+            "utilization": round(active / self._max_workers, 4) if self._max_workers > 0 else 0.0,
         }
+
+    def reset_stats(self) -> None:
+        """重置累计监控指标（不影响 active_threads、pending_tasks 等实时指标）"""
+        with self._stats_lock:
+            self._submitted_count = 0
+            self._completed_count = 0
+            self._failed_count = 0
+            self._rejected_count = 0
+            self._total_elapsed = 0.0
