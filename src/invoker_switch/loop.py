@@ -4,8 +4,9 @@ import asyncio
 import threading
 
 from concurrent.futures import ThreadPoolExecutor
-
 from typing_extensions import Optional
+
+from .executor import AdaptiveExecutor
 
 
 class EventLoopManager:
@@ -24,7 +25,7 @@ class EventLoopManager:
     # 内置模式的状态
     _internal_loop: Optional[asyncio.AbstractEventLoop] = None
     _internal_thread: Optional[threading.Thread] = None
-    _internal_executor: Optional[ThreadPoolExecutor] = None
+    _internal_executor: Optional[AdaptiveExecutor] = None
     _started: threading.Event = threading.Event()
     _lock: threading.Lock = threading.Lock()
 

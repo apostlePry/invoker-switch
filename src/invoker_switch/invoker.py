@@ -23,9 +23,10 @@ async def _to_thread(func: Callable[..., Any], *args: Any, **kwargs: Any) -> Any
     确保 ContextVar 在新线程中正确可见。
     """
     loop = EventLoopManager.get_event_loop()
+    executor = EventLoopManager.get_executor()
     ctx = contextvars.copy_context()
     func_call = functools.partial(func, *args, **kwargs)
-    return await loop.run_in_executor(None, lambda: ctx.run(func_call))
+    return await loop.run_in_executor(executor, lambda: ctx.run(func_call))
 
 
 class SyncInvoker:
