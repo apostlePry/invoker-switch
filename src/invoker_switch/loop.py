@@ -107,6 +107,9 @@ class EventLoopManager:
                 cls._executor = cls._ensure_internal_executor()
                 cls._loop.set_default_executor(cls._executor)
 
+                # 主线程也设置 event loop，使 asyncio.get_event_loop() 可用
+                asyncio.set_event_loop(cls._loop)
+
                 cls._thread = threading.Thread(
                     target=cls._run_internal_loop,
                     daemon=True,
