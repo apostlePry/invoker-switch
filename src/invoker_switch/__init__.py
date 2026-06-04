@@ -1,7 +1,14 @@
 """SyncInvoker — 统一同步/异步执行器"""
 
 from .detection import mark_wrapper
-from .executor import AdaptiveExecutor
+from .executor import (
+    AdaptiveExecutor,
+    RejectedExecutionError,
+    reject_abort,
+    reject_caller_runs,
+    reject_discard,
+    reject_discard_oldest,
+)
 from .invoker import SyncInvoker
 from .loop import EventLoopManager
 from .meta import InvokerBase, InvokerMeta, _invoker
@@ -14,7 +21,13 @@ RpcBase = InvokerBase
 
 __all__ = [
     # 核心
+    "SyncInvoker",
     "AdaptiveExecutor",
+    "RejectedExecutionError",
+    "reject_abort",
+    "reject_caller_runs",
+    "reject_discard",
+    "reject_discard_oldest",
     "InvokerBase",
     "InvokerMeta",
     # 类型

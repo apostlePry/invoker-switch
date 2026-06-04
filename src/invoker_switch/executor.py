@@ -1,8 +1,9 @@
 """自适应线程池 — Java ThreadPoolExecutor 模型
 
 核心线程始终存活，临时线程空闲超时后自动回收。
-继承 ThreadPoolExecutor，复用 submit/shutdown/Future 管理逻辑，
-只替换线程创建策略和 worker 函数。
+有界队列 + 拒绝策略，防止突发负载导致 OOM。
+继承 ThreadPoolExecutor，复用 Future 管理逻辑，
+只替换线程创建策略、队列类型和拒绝策略。
 """
 
 import queue
@@ -11,7 +12,7 @@ import weakref
 
 from concurrent.futures import ThreadPoolExecutor, _base
 
-from typing_extensions import Any, Dict
+from typing_extensions import Any, Callable, Dict
 
 
 # ─── 模块级全局状态 ───
@@ -21,9 +22,64 @@ _shutdown: bool = False
 _global_shutdown_lock: threading.Lock = threading.Lock()
 
 
+# ─── 拒绝策略 ───
+
+class RejectedExecutionError(RuntimeError):
+    """任务被拒绝执行（线程池队列已满）"""
+    pass
+
+
+def reject_abort(executor: "AdaptiveExecutor", func: Callable, args: tuple, kwargs: dict) -> Any:
+    """中止策略：抛出 RejectedExecutionError
+
+    调用方立刻知道系统过载，可自行决定降级或重试。
+    """
+    raise RejectedExecutionError(
+        f"Thread pool queue is full (capacity={executor._queue_capacity}, "
+        f"pending={executor._work_queue.qsize()}, "
+        f"active_threads={len(executor._threads)})"
+    )
+
+
+def reject_caller_runs(executor: "AdaptiveExecutor", func: Callable, args: tuple, kwargs: dict) -> Any:
+    """调用方执行策略：由提交任务的线程自己执行
+
+    自动降速：调用方线程被占用执行任务，无法继续提交新任务，
+    线程池有时间消化队列。等同于背压（backpressure）。
+    """
+    return func(*args, **kwargs)
+
+
+def reject_discard(executor: "AdaptiveExecutor", func: Callable, args: tuple, kwargs: dict) -> Any:
+    """丢弃策略：静默丢弃新任务，不抛异常"""
+    return None
+
+
+def reject_discard_oldest(executor: "AdaptiveExecutor", func: Callable, args: tuple, kwargs: dict) -> Any:
+    """丢弃最旧策略：从队列头部取出一个旧任务丢弃，再将新任务入队
+
+    让新任务优先级高于旧任务，适用于实时性要求高的场景。
+    旧任务被丢弃后，其 Future 会被取消。
+    """
+    try:
+        old_item = executor._work_queue.get_nowait()
+        if old_item is not None and hasattr(old_item, 'future'):
+            old_item.future.cancel()
+    except queue.Empty:
+        pass
+    # 队列已腾出一个空位，直接入队（不会再次 Full）
+    from concurrent.futures.thread import _WorkItem
+    f = _base.Future()
+    w = _WorkItem(f, func, args, kwargs)
+    executor._work_queue.put_nowait(w)
+    return f
+
+
+# ─── Worker 函数 ───
+
 def _worker_core(
     executor_reference: Any,
-    work_queue: queue.SimpleQueue,
+    work_queue: queue.Queue,
     initializer: Any,
     initargs: tuple,
 ) -> None:
@@ -89,7 +145,7 @@ def _worker_core(
 
 def _worker_temporary(
     executor_reference: Any,
-    work_queue: queue.SimpleQueue,
+    work_queue: queue.Queue,
     keep_alive: float,
     initializer: Any,
     initargs: tuple,
@@ -171,18 +227,23 @@ class AdaptiveExecutor(ThreadPoolExecutor):
     """自适应线程池 — Java ThreadPoolExecutor 模型
 
     参数说明：
-        core_workers:  核心线程数，始终存活不回收
-        max_workers:   最大线程数（核心+临时），高负载时创建临时线程
-        keep_alive:    临时线程空闲超时（秒），超时后自动退出
+        core_workers:      核心线程数，始终存活不回收
+        max_workers:       最大线程数（核心+临时），高负载时创建临时线程
+        keep_alive:        临时线程空闲超时（秒），超时后自动退出
+        queue_capacity:    任务队列容量，0 表示无界队列（兼容旧行为）
+        rejection_policy:  队列满时的拒绝策略
         thread_name_prefix: 线程名前缀
+
+    拒绝策略：
+        reject_abort:          抛出 RejectedExecutionError（默认）
+        reject_caller_runs:    由提交线程自己执行（背压）
+        reject_discard:        静默丢弃
+        reject_discard_oldest: 丢弃队列中最旧的任务
 
     扩缩策略：
         1. 提交任务时，优先唤醒空闲核心线程
         2. 核心线程全忙 + 有排队任务 → 创建临时线程（不超过 max_workers）
         3. 临时线程空闲超过 keep_alive → 自动退出，线程数回归到 core_workers
-
-    继承 ThreadPoolExecutor，复用 submit/shutdown/Future 等所有公共逻辑，
-    只替换线程创建策略（_adjust_thread_count）和 worker 函数。
     """
 
     def __init__(
@@ -190,6 +251,8 @@ class AdaptiveExecutor(ThreadPoolExecutor):
         core_workers: int = 4,
         max_workers: int = 32,
         keep_alive: float = 60.0,
+        queue_capacity: int = 0,
+        rejection_policy: Callable[["AdaptiveExecutor", Callable, tuple, dict], Any] = reject_abort,
         thread_name_prefix: str = "invoker-worker",
         initializer: Any = None,
         initargs: tuple = (),
@@ -207,6 +270,46 @@ class AdaptiveExecutor(ThreadPoolExecutor):
         )
         self._core_workers = core_workers
         self._keep_alive = keep_alive
+        self._queue_capacity = queue_capacity
+        self._rejection_policy = rejection_policy
+        self._rejected_count = 0
+
+        # 替换父类的无界 SimpleQueue 为有界 Queue
+        if queue_capacity > 0:
+            self._work_queue = queue.Queue(maxsize=queue_capacity)
+
+    def submit(self, fn, /, *args, **kwargs):
+        """提交任务，队列满时触发拒绝策略"""
+        with self._shutdown_lock:
+            if self._shutdown:
+                raise RuntimeError("cannot schedule new futures after shutdown")
+
+            # 创建 Future 和 WorkItem
+            f = _base.Future()
+            w = _base.WorkItem(f, fn, args, kwargs)
+
+            # 有界队列：尝试入队，满则触发拒绝策略
+            if self._queue_capacity > 0:
+                try:
+                    self._work_queue.put_nowait(w)
+                except queue.Full:
+                    self._rejected_count += 1
+                    result = self._rejection_policy(self, fn, args, kwargs)
+                    # reject_caller_runs 返回结果，需要包装成 Future
+                    if result is not None and not isinstance(result, _base.Future):
+                        f.set_result(result)
+                        return f
+                    # reject_discard 返回 None，返回一个已取消的 Future
+                    if result is None:
+                        f.cancel()
+                        return f
+                    return result
+            else:
+                # 无界队列：直接入队（兼容旧行为）
+                self._work_queue.put(w)
+
+            self._adjust_thread_count()
+            return f
 
     def _adjust_thread_count(self) -> None:
         """替换父类的线程创建策略，区分核心线程和临时线程
@@ -275,10 +378,7 @@ class AdaptiveExecutor(ThreadPoolExecutor):
         """
         with self._shutdown_lock:
             self._shutdown = True
-            # 设置 shutdown 标志后再发送 None 信号
-            # 这样 worker 在收到 None 时能正确判断退出
         # 向队列发送退出信号，数量等于当前线程数
-        # 每个 worker 收到一个 None 后退出
         threads_count = len(self._threads)
         for _ in range(threads_count):
             try:
@@ -308,4 +408,6 @@ class AdaptiveExecutor(ThreadPoolExecutor):
             "max_workers": self._max_workers,
             "pending_tasks": self._work_queue.qsize(),
             "keep_alive": self._keep_alive,
+            "queue_capacity": self._queue_capacity,
+            "rejected_count": self._rejected_count,
         }

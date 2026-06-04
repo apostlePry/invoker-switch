@@ -5,7 +5,13 @@ import time
 
 import pytest
 
-from invoker_switch import AdaptiveExecutor
+from invoker_switch import (
+    AdaptiveExecutor,
+    RejectedExecutionError,
+    reject_abort,
+    reject_caller_runs,
+    reject_discard,
+)
 
 
 class TestAdaptiveExecutorBasic:
@@ -177,3 +183,97 @@ class TestCompatibility:
         with TPE(max_workers=4) as executor:
             future = executor.submit(lambda: 42)
             assert future.result() == 42
+
+
+class TestBoundedQueue:
+    """有界队列测试"""
+
+    def test_unbounded_queue_default(self):
+        """默认 queue_capacity=0 为无界队列，不触发拒绝"""
+        with AdaptiveExecutor(core_workers=2, max_workers=4, queue_capacity=0) as executor:
+            # 提交超过 max_workers 的任务，全部能入队
+            futures = [executor.submit(lambda i=i: i * 2) for i in range(100)]
+            results = [f.result(timeout=5) for f in futures]
+            assert results == [i * 2 for i in range(100)]
+
+    def test_bounded_queue_reject_abort(self):
+        """有界队列满时，reject_abort 抛出 RejectedExecutionError"""
+        with AdaptiveExecutor(
+            core_workers=2, max_workers=4, queue_capacity=2,
+            rejection_policy=reject_abort,
+        ) as executor:
+            # 用 Event 占住所有线程
+            block_event = threading.Event()
+
+            def blocking_task():
+                block_event.wait(timeout=5)
+
+            # 占住 4 个线程（2 core + 2 temp）
+            blockers = [executor.submit(blocking_task) for _ in range(4)]
+            time.sleep(0.2)
+
+            # 队列还能放 2 个任务
+            queued = [executor.submit(lambda: "queued") for _ in range(2)]
+
+            # 队列满了 → 抛 RejectedExecutionError
+            with pytest.raises(RejectedExecutionError):
+                executor.submit(lambda: "rejected")
+
+            # 释放阻塞
+            block_event.set()
+            for f in blockers + queued:
+                f.result(timeout=5)
+
+    def test_bounded_queue_reject_caller_runs(self):
+        """reject_caller_runs 由提交线程自己执行，不抛异常"""
+        with AdaptiveExecutor(
+            core_workers=2, max_workers=4, queue_capacity=2,
+            rejection_policy=reject_caller_runs,
+        ) as executor:
+            block_event = threading.Event()
+
+            def blocking_task():
+                block_event.wait(timeout=5)
+
+            # 占住线程 + 填满队列
+            blockers = [executor.submit(blocking_task) for _ in range(4)]
+            queued = [executor.submit(lambda: "queued") for _ in range(2)]
+            time.sleep(0.2)
+
+            # 队列满 → caller_runs 在当前线程执行
+            result = executor.submit(lambda: "caller_runs_result")
+            assert result.result(timeout=5) == "caller_runs_result"
+
+            block_event.set()
+            for f in blockers + queued:
+                f.result(timeout=5)
+
+    def test_bounded_queue_reject_discard(self):
+        """reject_discard 静默丢弃任务，返回已取消的 Future"""
+        with AdaptiveExecutor(
+            core_workers=2, max_workers=4, queue_capacity=2,
+            rejection_policy=reject_discard,
+        ) as executor:
+            block_event = threading.Event()
+
+            def blocking_task():
+                block_event.wait(timeout=5)
+
+            blockers = [executor.submit(blocking_task) for _ in range(4)]
+            queued = [executor.submit(lambda: "queued") for _ in range(2)]
+            time.sleep(0.2)
+
+            # 队列满 → 丢弃
+            result = executor.submit(lambda: "discarded")
+            assert result.cancelled() or result.result(timeout=5) is None
+
+            block_event.set()
+            for f in blockers + queued:
+                f.result(timeout=5)
+
+    def test_stats_includes_queue_info(self):
+        """stats 包含队列容量和拒绝计数"""
+        with AdaptiveExecutor(core_workers=4, max_workers=16, queue_capacity=100) as executor:
+            stats = executor.stats
+            assert stats["queue_capacity"] == 100
+            assert stats["rejected_count"] == 0
