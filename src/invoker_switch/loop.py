@@ -57,10 +57,55 @@ class EventLoopManager:
         cls._executor = None
 
     @classmethod
-    def get_event_loop(cls) -> asyncio.AbstractEventLoop:
-        """获取事件循环：已有则直接返回，否则内置创建"""
+    def get_or_create_loop(cls) -> asyncio.AbstractEventLoop:
+        """获取或创建事件循环，但不执行 run_forever
+
+        使用 asyncio.new_event_loop() 或 asyncio.get_event_loop() 获取 loop，
+        不启动后台线程，不执行 run_forever()。
+        获取到的 loop 直接设置到 EventLoopManager._loop 中。
+        """
+        # 如果已经有保存的 loop，直接返回
         if cls._loop is not None:
             return cls._loop
+
+        # 尝试获取当前线程的事件循环
+        try:
+            loop = asyncio.get_event_loop()
+            if not loop.is_closed():
+                cls._loop = loop  # 直接设置到 EventLoopManager
+                return loop
+        except RuntimeError:
+            pass
+
+        # 没有可用的事件循环，创建一个新的
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        cls._loop = loop  # 直接设置到 EventLoopManager
+        return loop
+
+    @classmethod
+    def get_event_loop(cls) -> asyncio.AbstractEventLoop:
+        """获取事件循环：已有则直接返回，否则内置创建"""
+        # 1. 尝试获取当前正在运行的事件循环（FastAPI 等框架场景）
+        try:
+            running_loop = asyncio.get_running_loop()
+            # 如果没有缓存，或者缓存的 loop 和当前运行的不是同一个，则覆盖
+            if cls._loop is None or cls._loop is not running_loop:
+                cls._loop = running_loop
+            return cls._loop
+        except RuntimeError:
+            # 不在 async 上下文中，get_running_loop 会抛异常
+            pass
+
+        # 2. 不在 async 上下文中，使用 get_or_create_loop 获取/创建 loop
+        loop = cls.get_or_create_loop()
+
+        # 3. 判断 loop 是否正在运行
+        if loop.is_running():
+            # loop 已经在运行，直接返回
+            return loop
+
+        # 4. loop 没有运行，启动后台线程执行 run_forever()
         return cls._ensure_internal_loop()
 
     @classmethod
@@ -83,41 +128,40 @@ class EventLoopManager:
     @classmethod
     def _ensure_internal_loop(cls) -> asyncio.AbstractEventLoop:
         """双重检查锁定创建内置事件循环，并绑定默认线程池"""
-        if cls._loop is not None:
-            if not cls._check_loop_closed():
-                return cls._loop
+        # 如果 loop 存在且正在运行，直接返回
+        if cls._loop is not None and cls._loop.is_running():
+            return cls._loop
 
         with cls._lock:
+            # 再次检查，防止其他线程已经创建
+            if cls._loop is not None and cls._loop.is_running():
+                return cls._loop
+
+            # 如果 loop 存在但没有运行，先关闭它
             if cls._loop is not None:
                 if not cls._check_loop_closed():
-                    return cls._loop
+                    # loop 存在且未关闭，但没有运行，需要重新创建
+                    cls._loop = None
 
-            # 尝试获取当前运行的事件循环
-            try:
-                cls._loop = asyncio.get_running_loop()
-            except RuntimeError:
-                pass
+            # 创建新的事件循环
+            cls._started = threading.Event()
+            cls._loop = asyncio.new_event_loop()
 
-            # 没有运行中的循环，创建后台循环
-            if cls._loop is None:
-                cls._started = threading.Event()
-                cls._loop = asyncio.new_event_loop()
+            # 创建 AdaptiveExecutor 并设为 loop 的默认 executor
+            cls._executor = cls._ensure_internal_executor()
+            cls._loop.set_default_executor(cls._executor)
 
-                # 创建 AdaptiveExecutor 并设为 loop 的默认 executor
-                cls._executor = cls._ensure_internal_executor()
-                cls._loop.set_default_executor(cls._executor)
+            # 主线程也设置 event loop，使 asyncio.get_event_loop() 可用
+            asyncio.set_event_loop(cls._loop)
 
-                # 主线程也设置 event loop，使 asyncio.get_event_loop() 可用
-                asyncio.set_event_loop(cls._loop)
-
-                cls._thread = threading.Thread(
-                    target=cls._run_internal_loop,
-                    daemon=True,
-                    name="invoker-bg-loop",
-                )
-                assert cls._thread
-                cls._thread.start()
-                cls._started.wait()  # 等待循环启动
+            cls._thread = threading.Thread(
+                target=cls._run_internal_loop,
+                daemon=True,
+                name="invoker-bg-loop",
+            )
+            assert cls._thread
+            cls._thread.start()
+            cls._started.wait()  # 等待循环启动
 
             assert cls._loop is not None
             return cls._loop
