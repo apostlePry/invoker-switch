@@ -86,7 +86,11 @@ class EventLoopManager:
     @classmethod
     def get_event_loop(cls) -> asyncio.AbstractEventLoop:
         """获取事件循环：已有则直接返回，否则内置创建"""
-        # 1. 尝试获取当前正在运行的事件循环（FastAPI 等框架场景）
+        # 1. 如果已经有保存的 loop，直接返回
+        if cls._loop is not None:
+            return cls._loop
+
+        # 2. 尝试获取当前正在运行的事件循环（FastAPI 等框架场景）
         try:
             running_loop = asyncio.get_running_loop()
             # 如果没有缓存，或者缓存的 loop 和当前运行的不是同一个，则覆盖
@@ -97,15 +101,15 @@ class EventLoopManager:
             # 不在 async 上下文中，get_running_loop 会抛异常
             pass
 
-        # 2. 不在 async 上下文中，使用 get_or_create_loop 获取/创建 loop
+        # 3. 不在 async 上下文中，使用 get_or_create_loop 获取/创建 loop
         loop = cls.get_or_create_loop()
 
-        # 3. 判断 loop 是否正在运行
+        # 4. 判断 loop 是否正在运行
         if loop.is_running():
             # loop 已经在运行，直接返回
             return loop
 
-        # 4. loop 没有运行，启动后台线程执行 run_forever()
+        # 5. loop 没有运行，启动后台线程执行 run_forever()
         return cls._ensure_internal_loop()
 
     @classmethod

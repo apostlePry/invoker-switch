@@ -2,7 +2,7 @@
 
 from abc import ABCMeta
 
-from typing_extensions import Any, Callable, Dict, Tuple
+from typing_extensions import Any, Callable, Dict, Tuple, cast
 
 from .invoker import SyncInvoker
 
@@ -38,9 +38,16 @@ class InvokerMeta(ABCMeta):
         """
         invoker = cls._get_invoker()
 
-        def wrapper(self: Any, *args: Any, **kwargs: Any) -> Any:
-            return invoker.invoke(func, self, *args, **kwargs)
+        # 获取原始方法的返回类型
+        return_type = func.__annotations__.get('return', Any)
 
+        def wrapper(self: Any, *args: Any, **kwargs: Any) -> Any:
+            result = invoker.invoke(func, self, *args, **kwargs)
+            # 使用 cast 告诉 mypy 返回类型，避免类型检查报错
+            return cast(return_type, result)
+
+        # 保留原始方法的类型注解
+        wrapper.__annotations__ = func.__annotations__
         wrapper.__name__ = name
         wrapper.__qualname__ = func.__qualname__
         wrapper.__wrapped__ = func  # 保留原始方法引用

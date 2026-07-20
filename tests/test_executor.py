@@ -7,6 +7,7 @@ import pytest
 
 from invoker_switch import (
     AdaptiveExecutor,
+    ExecutorStats,
     RejectedExecutionError,
     reject_abort,
     reject_caller_runs,
